@@ -517,32 +517,29 @@ class STEVectorRenderer(nn.Module):
     def forward(self, use_tiling: bool = None) -> torch.Tensor:
         """
         Render current shapes to canvas.
-
-        Uses PyTorch path (reliable, autograd works).
-        Triton tile-based path available but backward needs fixes (see TASKS.md §8.7).
+        GPU: Triton tile-based kernel (verified forward+backward).
+        CPU: PyTorch fallback.
 
         Returns: [3, H, W] rendered image in sRGB [0, 1].
         """
-        # TODO: enable _triton_forward() once Triton backward is fixed
-        # if self.device == "cuda":
-        #     return self._triton_forward()
+        if self.device == "cuda":
+            return self._triton_forward()
         return self._pytorch_forward(use_tiling=use_tiling)
 
     def _triton_forward(self) -> torch.Tensor:
-        """Triton tile-based forward: hard alpha Over compositing in linear space."""
-        from .triton_kernels import TritonTileOverSTE
-        bg_linear = srgb_to_linear(self.background)  # [3]
-        # Triton returns [H, W, 3] in linear space
-        rendered_lin = TritonTileOverSTE.apply(
+        """Triton tile-based forward + backward (via autograd Function)."""
+        from .triton_kernels_v2 import TritonV2STE
+        from .loss import srgb_to_linear, linear_to_srgb
+        bg_linear = srgb_to_linear(self.background)
+        # Triton operates in linear space, returns [H, W, 3]
+        rendered_lin = TritonV2STE.apply(
             self.hard_templates, self.soft_templates, self.type_indices,
             self.cx, self.cy, self.rx, self.ry, self.angle,
             self.colors, self.opacity,
-            self.canvas_height, self.canvas_width,
-            bg_linear, TEMPLATE_FILL_RATIO, DEFAULT_TILE_SIZE,
-        )  # [H, W, 3] linear
+            self.canvas_height, self.canvas_width, bg_linear,
+        )
         # Convert to sRGB [3, H, W]
         result = linear_to_srgb(rendered_lin.permute(2, 0, 1))
-        result = torch.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0)
         return result.clamp(0.0, 1.0)
 
     def _pytorch_forward(self, use_tiling: bool = None) -> torch.Tensor:

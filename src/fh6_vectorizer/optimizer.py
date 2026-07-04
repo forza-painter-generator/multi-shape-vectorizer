@@ -53,28 +53,32 @@ def _flatten_config(config: dict, target: dict, prefix: str = ""):
 
 
 def compute_error_map(
-    rendered: torch.Tensor, target: torch.Tensor
+    rendered: torch.Tensor, target: torch.Tensor,
+    alpha_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute per-pixel error map for relocation targeting.
 
     Uses luminance-weighted MSE for better visual saliency.
+    If alpha_mask is provided, transparent regions get zero error.
 
     Args:
         rendered: [3, H, W]
         target: [3, H, W]
+        alpha_mask: [1, H, W] or [H, W], 0=transparent, 1=opaque
 
     Returns:
         error_map: [H, W] per-pixel error
     """
     diff = rendered - target
-    # Handle NaN (can happen with extreme parameter values)
     diff = torch.nan_to_num(diff, nan=0.0, posinf=1.0, neginf=-1.0)
-    # Luminance-weighted: (0.299R + 0.587G + 0.114B)
     lum_weights = torch.tensor([0.299, 0.587, 0.114], device=rendered.device).view(3, 1, 1)
     error = (diff * diff * lum_weights).sum(dim=0)
-    # Clamp to non-negative
     error = error.clamp(min=0.0)
+    if alpha_mask is not None:
+        if alpha_mask.dim() == 3:
+            alpha_mask = alpha_mask.squeeze(0)
+        error = error * alpha_mask
     return error
 
 
@@ -129,6 +133,13 @@ def find_relocation_candidates(
 
     # Also relocate shapes with very low opacity
     relocate_mask = relocate_mask | (opacity < min_opacity)
+
+    # Also relocate shapes with near-zero opacity (wasted resources)
+    dead_opacity = opacity < 0.02
+    relocate_mask = relocate_mask | dead_opacity
+    num_dead = dead_opacity.sum().item()
+    if num_dead > 0:
+        print(f"    Recycling {num_dead} dead (opacity≈0) shapes")
 
     return relocate_mask
 
@@ -295,6 +306,7 @@ class GradientOptimizer:
         target: torch.Tensor,
         config: Optional[dict] = None,
         importance_map: Optional[torch.Tensor] = None,
+        alpha_mask: Optional[torch.Tensor] = None,
         device: str = "cpu",
         snapshot_dir: Optional[str] = None,
         snapshot_interval: int = 50,
@@ -305,6 +317,7 @@ class GradientOptimizer:
             target: [3, H, W] target image in [0, 1]
             config: optimization hyperparameters (see configs/default.json)
             importance_map: [H, W] optional pre-computed importance map
+            alpha_mask: [1, H, W] optional alpha mask (0=transparent, 1=opaque)
             device: torch device
             snapshot_dir: if set, save intermediate renders to this dir every N steps
             snapshot_interval: save snapshot every N global steps
@@ -315,6 +328,14 @@ class GradientOptimizer:
         self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else None
         self.snapshot_interval = snapshot_interval
         self._global_step_counter = 0
+
+        # Alpha mask: broadcast to [1, H, W] for easy multiplication
+        if alpha_mask is not None:
+            if alpha_mask.dim() == 2:
+                alpha_mask = alpha_mask.unsqueeze(0)
+            self.alpha_mask = alpha_mask.to(device)
+        else:
+            self.alpha_mask = None
 
         # Default config
         cfg = {
@@ -465,6 +486,52 @@ class GradientOptimizer:
         rendered = self.renderer()
         loss, loss_dict = self._compute_loss(rendered)
 
+        # vinylizer-style alpha-aware loss:
+        # Transparent pixels → target = background color (so shapes get pushed away)
+        # Opaque pixels → target = real image
+        if self.alpha_mask is not None:
+            mask = self.alpha_mask  # [1, H, W]: 1=opaque, 0=transparent
+            bg = torch.zeros(3, 1, 1, device=self.device)  # black background
+            target_with_bg = self.target * mask + bg * (1.0 - mask)
+            # Full MSE on all pixels — transparent regions naturally push shapes away
+            loss = torch.nn.functional.mse_loss(rendered, target_with_bg)
+            loss_dict["mse"] = loss.item()
+
+            # Add L1 if configured
+            l1_w = self.cfg.get("l1_weight", 0.0)
+            if l1_w > 0:
+                l1_val = torch.nn.functional.l1_loss(rendered, target_with_bg) * l1_w
+                loss = loss + l1_val
+                loss_dict["l1"] = l1_val.item()
+
+            # Transparent-region loss: L1 for strong gradient on dark shapes
+            inv_mask = 1.0 - mask
+            t_l1 = ((rendered - bg) * inv_mask).abs().mean()
+            t_weight = self.cfg.get("transparent_weight", 3.0)
+            loss = loss + t_weight * t_l1
+            loss_dict["transparent_l1"] = t_l1.item()
+
+            # Boundary constraint (diffbmp-style): penalize shapes whose
+            # center is near transparent regions — their edges likely leak
+            H_m, W_m = mask.shape[1], mask.shape[2]
+            center_alpha = F.grid_sample(
+                mask.unsqueeze(0),
+                torch.stack([
+                    (self.renderer.cx / W_m) * 2 - 1,
+                    (self.renderer.cy / H_m) * 2 - 1,
+                ], dim=-1).unsqueeze(0).unsqueeze(0),
+                mode="bilinear", padding_mode="zeros", align_corners=True,
+            ).squeeze()
+            # Shapes near boundary: alpha in (0.1, 0.9) → penalize large rx/ry
+            boundary_mask = (center_alpha > 0.1) & (center_alpha < 0.9)
+            if boundary_mask.any():
+                boundary_penalty = (
+                    self.renderer.rx[boundary_mask].mean() +
+                    self.renderer.ry[boundary_mask].mean()
+                ) * 0.001
+                loss = loss + boundary_penalty
+                loss_dict["boundary_penalty"] = boundary_penalty.item()
+
         # Safety check
         if loss.grad_fn is None:
             raise RuntimeError(
@@ -513,6 +580,10 @@ class GradientOptimizer:
         self.scheduler.step()
         self.renderer.clamp_params()
 
+        # Clamp shape centers to opaque regions (if alpha mask available)
+        if self.alpha_mask is not None:
+            self._clamp_to_opaque()
+
         self.grad_history.append(grad_norms)
         if len(self.grad_history) > 50:
             self.grad_history.pop(0)
@@ -527,6 +598,25 @@ class GradientOptimizer:
 
         self._global_step_counter += 1
         return loss_dict
+
+    def _clamp_to_opaque(self):
+        """Remove shapes fully in transparent regions. Gentle boundary handling."""
+        with torch.no_grad():
+            mask = self.alpha_mask  # [1, H, W]
+            H, W = mask.shape[1], mask.shape[2]
+
+            px_n = (self.renderer.cx.data / W) * 2.0 - 1.0
+            py_n = (self.renderer.cy.data / H) * 2.0 - 1.0
+            grid = torch.stack([px_n, py_n], dim=-1).unsqueeze(0).unsqueeze(0)
+            alpha_at = F.grid_sample(
+                mask.unsqueeze(0), grid,
+                mode="bilinear", padding_mode="zeros", align_corners=True,
+            ).squeeze()
+
+            # Only kill shapes whose center is deep in transparent (alpha < 0.05)
+            kill = alpha_at < 0.05
+            if kill.any():
+                self.renderer.opacity.data[kill] = 0.01
 
     def _save_snapshot(self, step: int, loss_dict: dict):
         """Save an intermediate render snapshot to disk."""
@@ -619,7 +709,7 @@ class GradientOptimizer:
 
             # Phase B: Scan and relocate
             print(f"  Phase B: Scanning for useless shapes...")
-            error_map = compute_error_map(pre_reloc_render, self.target)
+            error_map = compute_error_map(pre_reloc_render, self.target, self.alpha_mask)
             relocate_mask = find_relocation_candidates(
                 self.renderer,
                 self.grad_history[-20:],

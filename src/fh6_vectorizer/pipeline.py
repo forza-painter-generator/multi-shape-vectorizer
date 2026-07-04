@@ -29,9 +29,9 @@ def load_target_image(
     path: Path,
     target_size: tuple[int, int] = (256, 256),
     device: str = "cpu",
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Load and preprocess a target image.
+    Load and preprocess a target image, preserving alpha channel.
 
     Args:
         path: path to image file
@@ -39,14 +39,16 @@ def load_target_image(
         device: torch device
 
     Returns:
-        target: [3, H, W] in [0, 1]
+        target: [3, H, W] RGB in [0, 1]
+        alpha_mask: [1, H, W] in [0, 1], 0=transparent, 1=opaque
     """
-    img = Image.open(path).convert("RGB")
+    img = Image.open(path).convert("RGBA")
     img = img.resize((target_size[1], target_size[0]), Image.LANCZOS)
     arr = torch.from_numpy(np.array(img)).float() / 255.0
-    # HWC → CHW
-    arr = arr.permute(2, 0, 1)
-    return arr.to(device)
+    # HWC: [R, G, B, A]
+    rgb = arr[:, :, :3].permute(2, 0, 1).to(device)  # [3, H, W]
+    alpha = arr[:, :, 3:4].permute(2, 0, 1).to(device)  # [1, H, W]
+    return rgb, alpha
 
 
 def load_config(config_path: Path) -> dict:
@@ -62,17 +64,24 @@ def load_config(config_path: Path) -> dict:
         return json.load(f)
 
 
-def save_output_image(tensor: torch.Tensor, path: Path) -> None:
+def save_output_image(tensor: torch.Tensor, path: Path, alpha_mask: torch.Tensor = None) -> None:
     """
-    Save a rendered image tensor to file.
+    Save a rendered image tensor to file, with optional alpha.
 
     Args:
         tensor: [3, H, W] in [0, 1]
         path: output path (.png)
+        alpha_mask: [1, H, W] or [H, W] in [0, 1], applied as alpha channel
     """
     arr = tensor.detach().cpu().permute(1, 2, 0).numpy()
     arr = (arr.clip(0, 1) * 255).astype("uint8")
-    img = Image.fromarray(arr)
+    if alpha_mask is not None:
+        a = alpha_mask.detach().cpu()
+        if a.dim() == 3:
+            a = a.squeeze(0)
+        a = (a.clip(0, 1) * 255).to(torch.uint8).numpy()
+        arr = np.dstack([arr, a])
+    img = Image.fromarray(arr, "RGBA" if alpha_mask is not None else "RGB")
     img.save(path)
     print(f"Saved output to {path}")
 
@@ -139,15 +148,17 @@ def run_pipeline(
 
     # --- Step 2: Load target image ---
     print("\nStep 2: Loading target image...")
-    target = load_target_image(target_image_path, target_size=canvas_size, device=device)
-    print(f"  Target size: {target.shape}")
+    target, alpha_mask = load_target_image(target_image_path, target_size=canvas_size, device=device)
+    print(f"  Target size: {target.shape}, alpha range: [{alpha_mask.min():.2f}, {alpha_mask.max():.2f}]")
+    has_transparency = (alpha_mask < 0.99).any().item()
+    if has_transparency:
+        print("  Detected transparency - transparent regions will be ignored")
 
     # --- Step 2.5: Compute importance map (for smart initialization) ---
     importance_map = None
     use_imp = config.get("use_importance_sampling", True) if config else True
     if use_imp:
         print("  Computing importance map...")
-        # Convert target tensor → numpy uint8 for OpenCV
         target_np = target.cpu().permute(1, 2, 0).numpy()
         target_np = (target_np * 255).astype(np.uint8)
         importance_map = compute_importance_map(
@@ -157,6 +168,9 @@ def run_pipeline(
             uniform_weight=config.get("uniform_weight", 0.2) if config else 0.2,
             kmeans_k=config.get("kmeans_k") if config else None,
         ).to(device)
+        # Zero out importance in transparent regions
+        if has_transparency:
+            importance_map = importance_map * alpha_mask.squeeze(0)
         print(f"  Importance map: {importance_map.shape}")
 
     # --- Step 3: Initialize renderer ---
@@ -178,6 +192,7 @@ def run_pipeline(
         target=target,
         config=config,
         importance_map=importance_map,
+        alpha_mask=alpha_mask if has_transparency else None,
         device=device,
         snapshot_dir=str(snapshot_dir) if snapshot_dir else None,
         snapshot_interval=config.get("snapshot_interval", 25) if config else 25,
@@ -191,7 +206,7 @@ def run_pipeline(
     # --- Step 6: Save outputs ---
     if output_path:
         # Save rendered image
-        save_output_image(final, output_path)
+        save_output_image(final, output_path)  # RGB only, no alpha mask
 
         # Save FH6 JSON if requested
         if config and config.get("include_fh6_json", False):

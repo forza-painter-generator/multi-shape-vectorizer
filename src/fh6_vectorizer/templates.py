@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 # --- Config ---
 TEMPLATE_SIZE = 128  # px, template texture resolution
-DEFAULT_SIGMA = 0.5  # Gaussian blur sigma for soft templates
+DEFAULT_SIGMA = 2.0  # Wider soft edge for better gradient reach (was 0.5)
 FH6_COORD_RANGE = 128.0  # FH6 vertices are in [-128, 128] range
 
 # Family name → type_code base (from forza-painter-fh6)
@@ -333,6 +333,20 @@ def generate_synthetic_templates(
     ], dtype=np.int32)
     cv2.fillPoly(canvas, [star4_pts], 1.0)
     _make_shape("star4", canvas)
+
+    # 16: Gradient ellipse (radial gradient, continuous falloff)
+    # Key difference from regular ellipse (#3):
+    #   - Hard: threshold at 0.5 (binary, same STE forward as others)
+    #   - Soft: raw gradient values [0,1] (gradient over ENTIRE area, not just edges!)
+    # This gives much better gradient signal during optimization.
+    y_idx, x_idx = np.ogrid[:s, :s]
+    rx_px = s * 0.45
+    ry_px = s * 0.45
+    dist = np.sqrt(((x_idx - center) / rx_px) ** 2 + ((y_idx - center) / ry_px) ** 2)
+    grad = np.clip(1.0 - dist, 0.0, 1.0)
+    names.append("gradient_ellipse")
+    hard.append(torch.from_numpy((grad >= 0.5).astype(np.float32)))
+    soft.append(torch.from_numpy(grad.astype(np.float32)))
 
     # Truncate to requested number
     hard = hard[:num_types]
