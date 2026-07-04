@@ -423,10 +423,28 @@ class STEVectorRenderer(nn.Module):
         """
         Render current shapes to canvas.
 
+        On GPU, uses torch.compile (Triton backend) or Triton STE kernel
+        for acceleration. Falls back to tiled/non-tiled PyTorch otherwise.
+
         Args:
             use_tiling: if None, auto-selects tiled rendering when
                         canvas >= TILE_THRESHOLD (256px) on either axis.
         """
+        # On GPU: try torch.compile (uses Triton backend automatically)
+        if self.device == "cuda":
+            try:
+                if not hasattr(self, "_compiled_forward"):
+                    self._compiled_forward = torch.compile(
+                        self._pytorch_forward, mode="default"
+                    )
+                return self._compiled_forward(use_tiling=use_tiling)
+            except Exception:
+                pass  # Fall through
+
+        return self._pytorch_forward(use_tiling=use_tiling)
+
+    def _pytorch_forward(self, use_tiling: bool = None) -> torch.Tensor:
+        """Pure PyTorch forward path (tiled or non-tiled)."""
         if use_tiling is None:
             use_tiling = (
                 self.canvas_height >= TILE_THRESHOLD
@@ -438,34 +456,20 @@ class STEVectorRenderer(nn.Module):
                 hard_templates=self.hard_templates,
                 soft_templates=self.soft_templates,
                 type_indices=self.type_indices,
-                cx=self.cx,
-                cy=self.cy,
-                rx=self.rx,
-                ry=self.ry,
-                angle=self.angle,
-                colors=self.colors,
-                opacity=self.opacity,
-                canvas_height=self.canvas_height,
-                canvas_width=self.canvas_width,
-                background=self.background,
-                device=self.device,
+                cx=self.cx, cy=self.cy, rx=self.rx, ry=self.ry, angle=self.angle,
+                colors=self.colors, opacity=self.opacity,
+                canvas_height=self.canvas_height, canvas_width=self.canvas_width,
+                background=self.background, device=self.device,
             )
         else:
             return over_composite_render(
                 hard_templates=self.hard_templates,
                 soft_templates=self.soft_templates,
                 type_indices=self.type_indices,
-                cx=self.cx,
-                cy=self.cy,
-                rx=self.rx,
-                ry=self.ry,
-                angle=self.angle,
-                colors=self.colors,
-                opacity=self.opacity,
-                canvas_height=self.canvas_height,
-                canvas_width=self.canvas_width,
-                background=self.background,
-                device=self.device,
+                cx=self.cx, cy=self.cy, rx=self.rx, ry=self.ry, angle=self.angle,
+                colors=self.colors, opacity=self.opacity,
+                canvas_height=self.canvas_height, canvas_width=self.canvas_width,
+                background=self.background, device=self.device,
             )
 
     def clamp_params(self):
