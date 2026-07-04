@@ -109,7 +109,7 @@
   - `load_template_library()`: `torch.load()` 带回 `weights_only=False`
   - Pipeline 中使用 `template_cache_path` 参数支持缓存
 
-- [ ] **2.2.7 — 模板可视化工具**
+- [x] **2.2.7 — 模板可视化工具**
   - 创建一个脚本 `scripts/visualize_templates.py`
   - 将 hard 和 soft 模板并排保存为 PNG 网格
   - 用于验证模板生成正确性（特别是 FH6 模板的坐标映射）
@@ -210,7 +210,7 @@
 
 ### 3.3 Tile-based 渲染（性能优化）
 
-- [ ] **3.3.1 — Tile renderer 架构**
+- [x] **3.3.1 — Tile renderer 架构**
   - 当前: 全图逐形状渲染（`O(N × H × W)`），大画布时慢
   - 实现 tile-based: 将画布分为 `TILE_SIZE × TILE_SIZE` 块（如 128×128 或 256×256）
   - 对每个 tile，AABB 测试 → 只渲染重叠的形状
@@ -219,11 +219,11 @@
     - vinylizer `src/cuda/render_kernel.cu` L95-145 — tile-based `render_tile_forward_kernel`
     - `IMPLEMENTATION_PLAN.md` §5.5 — Chunked primitive processing
 
-- [ ] **3.3.2 — AABB (Axis-Aligned Bounding Box) 计算**
+- [x] **3.3.2 — AABB 计算**
   - 对每个形状，根据 `(cx, cy, rx, ry, angle)` 计算旋转后的包围盒
   - 快速 AABB 近似: `max_extent = max(rx, ry) * 1.5`（考虑旋转 + blur 扩展）
 
-- [ ] **3.3.3 — Tile 级别 scratch buffer 管理**
+- [x] **3.3.3 — Tile buffer 管理**
   - 每个 tile 维护自己的 `C` 和 `T` buffer
   - 最后合并所有 tile 为完整图像
   - 参考: vinylizer `src/cuda/canvas_render.cu` L28-88 — tile 级别 scratch
@@ -290,7 +290,7 @@
   - `frozen_mask=True` 的形状: `param.grad[frozen_mask] = 0`（冻结梯度）
   - 新重定位的形状正常优化
 
-- [ ] **4.2.6 — 重定位后 MSE 回退处理**
+- [x] **4.2.6 — 重定位后 MSE 回退处理**
   - 问题: 当前重定位后 MSE 会暂时升高（新形状从随机位置开始）
   - 改进: 如果 Phase C 后 MSE 比 Phase A 结束时的 MSE 差太多，回滚重定位
   - 或者: 对新形状使用更小的 scale 初始化（先从局部小形状开始）
@@ -597,7 +597,7 @@
 - [x] **9.2.1 — 优化过程日志记录**
   - 自动保存 `output_path.history.json` — 含所有 loss 分量
 
-- [ ] **9.2.2 — Loss 曲线绘图脚本**
+- [x] **9.2.2 — Loss 曲线绘图脚本**
   - 创建 `scripts/plot_loss.py`
   - 读取 JSON 日志 → matplotlib 绘制 MSE + Perceptual loss 曲线
   - 标注 cycle 边界（Phase A→B→C 转换点）
@@ -635,17 +635,17 @@
 
 ### 10.2 待添加的测试
 
-- [ ] **10.2.1 — Over compositing 正确性测试**
+- [x] **10.2.1 — Over compositing 正确性测试**
   - 验证: 两个不透明形状叠加 → 只有前面的可见
   - 验证: 半透明形状 → 颜色正确混合
   - 验证: z-order 影响（不同顺序 → 不同结果）
 
-- [ ] **10.2.2 — 坐标变换正确性测试**
+- [x] **10.2.2 — 坐标变换正确性测试**
   - 验证: 旋转 90° 的形状 → 与预期模板位置一致
   - 验证: 缩放 2× 的形状 → 占据 2× 像素
   - 验证: 不同 TEMPLATE_FILL_RATIO 值的影响
 
-- [ ] **10.2.3 — STE 精度测试**
+- [x] **10.2.3 — STE 精度测试**
   - 对比: STE 梯度 vs 纯软模板梯度（当 sigma→0 时应趋同）
   - 记录不同 sigma 下的梯度偏差
 
@@ -653,7 +653,7 @@
   - 测试 `render_fh6_shape()` 对已知 FH6 图形的渲染
   - 对比渲染结果与 FH6 预览 PNG (`Vinyls/<Family>/<index>.png`)
 
-- [ ] **10.2.5 — 重定位逻辑测试**
+- [x] **10.2.5 — 重定位逻辑测试**
   - 验证: 低梯度+低 opacity 形状被正确标记
   - 验证: 重定位后形状参数在有效范围内
   - 验证: frozen_mask 正确阻止梯度更新
@@ -674,7 +674,7 @@
 
 ### 11.1 项目文档
 
-- [ ] **11.1.1 — `README.md` 项目说明**
+- [x] **11.1.1 — `README.md` 项目说明**
   - 项目概述、安装步骤、使用示例
   - 架构图 (Mermaid)
   - 参考: `IMPLEMENTATION_PLAN.md` §1 项目概述
@@ -745,5 +745,5 @@
 ## 统计
 
 - **总条目**: ~80
-- **已完成**: ~50 (63%)
-- **待实现**: ~30 (37%)
+- **已完成**: ~60 (75%)
+- **待实现**: ~20 (25%)

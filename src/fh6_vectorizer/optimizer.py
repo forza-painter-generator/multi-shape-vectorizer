@@ -517,6 +517,17 @@ class GradientOptimizer:
 
         return history
 
+    def _snapshot_params(self) -> dict:
+        """Save a snapshot of all optimizable parameters."""
+        names = ["cx", "cy", "rx", "ry", "angle", "colors", "opacity", "type_indices"]
+        return {n: getattr(self.renderer, n).data.clone() for n in names}
+
+    def _restore_params(self, snapshot: dict):
+        """Restore parameters from a snapshot."""
+        with torch.no_grad():
+            for n, v in snapshot.items():
+                getattr(self.renderer, n).data.copy_(v)
+
     def optimize(self) -> list[dict]:
         """
         Run full optimization pipeline.
@@ -526,6 +537,7 @@ class GradientOptimizer:
         """
         full_history = []
         num_types = self.renderer.hard_templates.shape[0]
+        rollback_threshold = self.cfg.get("relocation_rollback_factor", 1.5)
 
         for cycle in range(self.cfg["num_cycles"]):
             print(f"\n{'='*50}")
@@ -537,14 +549,18 @@ class GradientOptimizer:
             hist_a = self.run_cycle(cycle, frozen_mask=None)
             full_history.extend(hist_a)
 
+            # Record pre-relocation state
+            with torch.no_grad():
+                pre_reloc_render = self.renderer()
+            pre_reloc_mse = F.mse_loss(pre_reloc_render, self.target).item()
+            pre_snapshot = self._snapshot_params()
+
             # Phase B: Scan and relocate
             print(f"  Phase B: Scanning for useless shapes...")
-            with torch.no_grad():
-                rendered = self.renderer()
-            error_map = compute_error_map(rendered, self.target)
+            error_map = compute_error_map(pre_reloc_render, self.target)
             relocate_mask = find_relocation_candidates(
                 self.renderer,
-                self.grad_history[-20:],  # Last 20 steps
+                self.grad_history[-20:],
                 relocation_fraction=self.cfg["relocation_fraction"],
             )
             num_relocated = relocate_mask.sum().item()
@@ -561,6 +577,24 @@ class GradientOptimizer:
                 print(f"  Phase C: Local optimization ({self.cfg['local_steps']} steps)")
                 hist_c = self.run_cycle(cycle, frozen_mask=~relocate_mask)
                 full_history.extend(hist_c)
+
+                # Rollback check: if Phase C made things significantly worse, revert
+                with torch.no_grad():
+                    post_c_render = self.renderer()
+                post_c_mse = F.mse_loss(post_c_render, self.target).item()
+
+                if post_c_mse > pre_reloc_mse * rollback_threshold:
+                    print(
+                        f"    ⚠ MSE degraded ({pre_reloc_mse:.6f} → {post_c_mse:.6f}), "
+                        f"rolling back relocation"
+                    )
+                    self._restore_params(pre_snapshot)
+                    # Remove Phase C history entries
+                    full_history = full_history[:-len(hist_c)]
+                else:
+                    print(
+                        f"    MSE: {pre_reloc_mse:.6f} → {post_c_mse:.6f}"
+                    )
 
         return full_history
 
