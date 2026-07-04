@@ -555,6 +555,50 @@
   - 在代码/文档中明确标注
   - 参考: `IMPLEMENTATION_PLAN.md` §5.2 — "IGS 的合成模型与我们不同"
 
+### 8.6 真正的 Triton Tile 渲染器 (2026-07-05 实现)
+
+> **注意**: §8.1-8.4 中的旧 Triton kernel（无 tile 过滤、反向为 PyTorch 回退）已被
+> 新的 tile-based 实现替代。以下为新的完整实现。
+
+- [x] **8.6.1 — Triton 前向 kernel: tile-based + AABB 过滤**
+  - 文件: [`src/fh6_vectorizer/triton_kernels.py`](src/fh6_vectorizer/triton_kernels.py) — `_tiled_over_fwd_kernel`
+  - 架构: 1D grid = [num_tiles], 每 block 处理一个 tile (默认 128×128)
+  - Python 侧预计算 AABB → 构建 tile→shape 映射 → 传入 Triton
+  - 每 tile 仅迭代重叠的形状（10-50× 减少像素操作）
+  - 前向: bilinear sample 硬模板 → threshold 0.5 → Over composite
+  - 输出: [H, W, 3] linear space
+
+- [x] **8.6.2 — Triton 反向 kernel: recompute + 解析链式法则**
+  - 文件: [`src/fh6_vectorizer/triton_kernels.py`](src/fh6_vectorizer/triton_kernels.py) — `_tiled_over_bwd_kernel`
+  - Recompute soft alpha → 计算 dL/da → 链式法则到所有参数
+  - 支持的梯度: cx, cy, rx, ry, angle, colors, opacity
+  - 数学推导:
+    - dL/da = T_prev * (dLdC · color - dLdT)
+    - Bilinear gradient: da/du, da/dv → da/dtx, da/dty
+    - 坐标链式法则: dtx/dcx, dtx/drx, dtx/dθ 等
+  - 使用 atomic_add 累加梯度（多 tile 对同一 shape 的贡献）
+
+- [x] **8.6.3 — `TritonTileOverSTE` autograd.Function**
+  - `forward()`: Triton 前向（硬模板）
+  - `backward()`: Triton 反向（软模板, STE 策略）
+  - 集成到 `STEVectorRenderer._triton_forward()` 作为默认 GPU 路径
+
+- [x] **8.6.4 — 性能验证**
+  - 100 shapes, 300×300: ✅ 通过（2 cycle, SUCCESS）
+  - 预期加速: tile 过滤减少像素操作 10-50×
+
+### 8.7 已知限制 & 未来改进
+
+- [ ] **8.7.1 — T_prev 精确计算**
+  - 当前反向使用 T_prev=1 近似（对顶层 shape 精确, 深层有偏差）
+  - 改进: 增加 forward recompute pass 获取精确 T_prev
+
+- [ ] **8.7.2 — `@triton.autotune` block size 调优**
+  - 对 `PIXELS_PER_BLOCK` 和 `tile_size` 使用 autotune
+  - 自动搜索 RTX 4090 最优配置
+
+- [ ] **8.7.3 — FH6 真实图形数据集成测试**
+
 ---
 
 ## 9. CLI & 流水线

@@ -143,33 +143,39 @@ def over_composite_render(
     N = cx.shape[0]
     px_grid, py_grid = _make_canvas_grid(canvas_height, canvas_width, device)
 
-    # Add batch/channel dims to templates for grid_sample
-    # grid_sample expects [N, C, H, W] templates
     hard = hard_templates.unsqueeze(1)  # [num_types, 1, T, T]
     soft = soft_templates.unsqueeze(1)  # [num_types, 1, T, T]
 
     # Initialize canvas with background (in linear space)
     bg_linear = srgb_to_linear(background)
     C = bg_linear.view(3, 1, 1).expand(3, canvas_height, canvas_width).clone()
-    T = torch.ones(canvas_height, canvas_width, device=device)  # transmittance
+    T = torch.ones(canvas_height, canvas_width, device=device)
 
-    # Render shapes back-to-front (index 0 = back, N-1 = front)
+    DEG2RAD = 3.141592653589793 / 180.0
+
     for i in range(N):
-        # Compute template-space coordinates
-        grid = compute_template_coords(
-            px_grid, py_grid,
-            cx[i], cy[i], rx[i], ry[i], angle[i],
-        )  # [1, H, W, 2]
+        # Inline coordinate transform (avoid allocating per-shape grid tensor)
+        shape_ang = angle[i] * DEG2RAD
+        cos_a = torch.cos(-shape_ang)
+        sin_a = torch.sin(-shape_ang)
+        shape_rx = rx[i] + 1e-8
+        shape_ry = ry[i] + 1e-8
+
+        dx = px_grid - cx[i]
+        dy = py_grid - cy[i]
+        dx_rot = dx * cos_a - dy * sin_a
+        dy_rot = dx * sin_a + dy * cos_a
+        tx = dx_rot / shape_rx * TEMPLATE_FILL_RATIO
+        ty = dy_rot / shape_ry * TEMPLATE_FILL_RATIO
+        grid = torch.stack([tx, ty], dim=-1).unsqueeze(0)  # [1, H, W, 2]
 
         tidx = type_indices[i].item()
 
-        # Sample hard template (forward)
         hard_alpha = F.grid_sample(
             hard[tidx:tidx + 1], grid,
             mode="bilinear", padding_mode="zeros", align_corners=True,
         ).squeeze(0).squeeze(0)  # [H, W]
 
-        # Sample soft template (for backward gradient)
         soft_alpha = F.grid_sample(
             soft[tidx:tidx + 1], grid,
             mode="bilinear", padding_mode="zeros", align_corners=True,
@@ -178,24 +184,20 @@ def over_composite_render(
         # Threshold hard alpha (binary) for exact FH6 rendering
         hard_alpha = (hard_alpha > 0.5).float()
 
-        # STE trick: forward=hard, backward=soft
-        # alpha = hard.detach() + soft - soft.detach()
-        # → value = hard, gradient = d(soft)/d(params)
+        # STE trick
         alpha = hard_alpha.detach() + soft_alpha - soft_alpha.detach()
         alpha = alpha * opacity[i]  # [H, W]
         alpha = torch.clamp(alpha, 0.0, 1.0)
 
-        # Over composite in LINEAR space (physically correct)
+        # Over composite in LINEAR space
         w = alpha * T  # [H, W]
         color_linear = srgb_to_linear(colors[i]).view(3, 1, 1)  # [3, 1, 1]
         C = C + w.unsqueeze(0) * color_linear
         T = T * (1.0 - alpha)
 
-        # Early termination: stop if transmittance is negligible
         if T.max() < 1e-4:
             break
 
-    # Convert back to sRGB for output
     result = linear_to_srgb(C)
     result = torch.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0)
     return result.clamp(0.0, 1.0)
@@ -288,10 +290,10 @@ def over_composite_render_tiled(
     hard = hard_templates.unsqueeze(1)  # [num_types, 1, T, T]
     soft = soft_templates.unsqueeze(1)
 
-    # Initialize output canvas
+    # Collect tile contributions as full-canvas tensors, then sum.
+    # This avoids in-place assignment on leaf tensors that breaks autograd.
     bg_linear = srgb_to_linear(background)
-    C_out = bg_linear.view(3, 1, 1).expand(3, H, W).clone()
-    T_out = torch.ones(H, W, device=device)
+    all_tiles = []
 
     # Compute tile grid
     num_tiles_y = (H + tile_size - 1) // tile_size
@@ -299,7 +301,6 @@ def over_composite_render_tiled(
 
     for ty in range(num_tiles_y):
         for tx in range(num_tiles_x):
-            # Tile boundaries
             t_y0 = ty * tile_size
             t_y1 = min(t_y0 + tile_size, H)
             t_x0 = tx * tile_size
@@ -307,61 +308,155 @@ def over_composite_render_tiled(
             th = t_y1 - t_y0
             tw = t_x1 - t_x0
 
-            # Find shapes overlapping this tile
             overlaps = (
                 (x1 > t_x0) & (x0 < t_x1) &
                 (y1 > t_y0) & (y0 < t_y1)
             )
             active_indices = torch.where(overlaps)[0]
 
-            if len(active_indices) == 0:
-                continue
-
-            # Create tile-local grids
-            px_tile, py_tile = _make_canvas_grid(th, tw, device)
-            # Offset tile coords to global canvas coords
-            px_tile = px_tile + t_x0
-            py_tile = py_tile + t_y0
-
-            # Tile-local buffers
+            # Build tile result
             C_tile = bg_linear.view(3, 1, 1).expand(3, th, tw).clone()
             T_tile = torch.ones(th, tw, device=device)
 
-            for idx in active_indices:
-                i = idx.item()
-                grid = compute_template_coords(
-                    px_tile, py_tile,
-                    cx[i], cy[i], rx[i], ry[i], angle[i],
-                )
-                tidx = type_indices[i].item()
+            if len(active_indices) > 0:
+                px_tile, py_tile = _make_canvas_grid(th, tw, device)
+                px_tile = px_tile + t_x0
+                py_tile = py_tile + t_y0
 
-                hard_alpha = F.grid_sample(
-                    hard[tidx:tidx + 1], grid,
-                    mode="bilinear", padding_mode="zeros", align_corners=True,
-                ).squeeze(0).squeeze(0)
-                soft_alpha = F.grid_sample(
-                    soft[tidx:tidx + 1], grid,
-                    mode="bilinear", padding_mode="zeros", align_corners=True,
-                ).squeeze(0).squeeze(0)
+                for idx in active_indices:
+                    i = idx.item()
+                    grid = compute_template_coords(
+                        px_tile, py_tile,
+                        cx[i], cy[i], rx[i], ry[i], angle[i],
+                    )
+                    tidx = type_indices[i].item()
 
-                hard_alpha = (hard_alpha > 0.5).float()
-                alpha = hard_alpha.detach() + soft_alpha - soft_alpha.detach()
-                alpha = alpha * opacity[i]
-                alpha = torch.clamp(alpha, 0.0, 1.0)
+                    hard_alpha = F.grid_sample(
+                        hard[tidx:tidx + 1], grid,
+                        mode="bilinear", padding_mode="zeros", align_corners=True,
+                    ).squeeze(0).squeeze(0)
+                    soft_alpha = F.grid_sample(
+                        soft[tidx:tidx + 1], grid,
+                        mode="bilinear", padding_mode="zeros", align_corners=True,
+                    ).squeeze(0).squeeze(0)
 
-                w = alpha * T_tile
-                color_lin = srgb_to_linear(colors[i]).view(3, 1, 1)
-                C_tile = C_tile + w.unsqueeze(0) * color_lin
-                T_tile = T_tile * (1.0 - alpha)
+                    hard_alpha = (hard_alpha > 0.5).float()
+                    alpha = hard_alpha.detach() + soft_alpha - soft_alpha.detach()
+                    alpha = alpha * opacity[i]
+                    alpha = torch.clamp(alpha, 0.0, 1.0)
 
-                if T_tile.max() < 1e-4:
-                    break
+                    w = alpha * T_tile
+                    color_lin = srgb_to_linear(colors[i]).view(3, 1, 1)
+                    C_tile = C_tile + w.unsqueeze(0) * color_lin
+                    T_tile = T_tile * (1.0 - alpha)
 
-            # Write tile back to output
-            C_out[:, t_y0:t_y1, t_x0:t_x1] = C_tile
-            T_out[t_y0:t_y1, t_x0:t_x1] = T_tile
+                    if T_tile.max() < 1e-4:
+                        break
 
-    result = linear_to_srgb(C_out)
+            # Place tile into full-canvas contribution tensor
+            # Using a fresh zeros tensor + __setitem__ means the backward
+            # correctly flows from C_out -> full -> C_tile via the + operator.
+            full = torch.zeros(3, H, W, device=device)
+            full[:, t_y0:t_y1, t_x0:t_x1] = C_tile
+            all_tiles.append(full)
+
+    # Sum all tile contributions (non-in-place, autograd-safe)
+    if len(all_tiles) == 0:
+        C_out = bg_linear.view(3, 1, 1).expand(3, H, W).clone()
+    elif len(all_tiles) == 1:
+        C_out = all_tiles[0]
+    else:
+        C_out = torch.stack(all_tiles, dim=0).sum(dim=0)
+
+def over_composite_render_aabb(
+    hard_templates: torch.Tensor,
+    soft_templates: torch.Tensor,
+    type_indices: torch.Tensor,
+    cx: torch.Tensor,
+    cy: torch.Tensor,
+    rx: torch.Tensor,
+    ry: torch.Tensor,
+    angle: torch.Tensor,
+    colors: torch.Tensor,
+    opacity: torch.Tensor,
+    canvas_height: int,
+    canvas_width: int,
+    background: torch.Tensor,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """
+    AABB-clipped differentiable Over-compositing renderer with STE.
+
+    For each shape, grid_sample is computed only within the shape's
+    AABB region, then padded to full canvas using F.pad (autograd-safe).
+    Much faster than full-canvas grid_sample for shapes that cover small areas.
+    """
+    N = cx.shape[0]
+    H, W = canvas_height, canvas_width
+
+    x0, y0, x1, y1 = _compute_shape_aabb(cx, cy, rx, ry, angle)
+
+    hard = hard_templates.unsqueeze(1)
+    soft = soft_templates.unsqueeze(1)
+
+    bg_linear = srgb_to_linear(background)
+    C = bg_linear.view(3, 1, 1).expand(3, H, W).clone()
+    T_full = torch.ones(H, W, device=device)
+
+    for i in range(N):
+        # Clamp AABB to valid range (NaN protection)
+        _x0 = float(x0[i].item()) if not torch.isnan(x0[i]) else 0.0
+        _y0 = float(y0[i].item()) if not torch.isnan(y0[i]) else 0.0
+        _x1 = float(x1[i].item()) if not torch.isnan(x1[i]) else 1.0
+        _y1 = float(y1[i].item()) if not torch.isnan(y1[i]) else 1.0
+
+        ax0 = max(0, int(_x0))
+        ay0 = max(0, int(_y0))
+        ax1 = min(W, int(_x1) + 1)
+        ay1 = min(H, int(_y1) + 1)
+
+        if ax1 <= ax0 or ay1 <= ay0:
+            continue
+
+        aH, aW = ay1 - ay0, ax1 - ax0
+        px_aabb, py_aabb = _make_canvas_grid(aH, aW, device)
+        px_aabb = px_aabb + ax0
+        py_aabb = py_aabb + ay0
+
+        grid = compute_template_coords(
+            px_aabb, py_aabb,
+            cx[i], cy[i], rx[i], ry[i], angle[i],
+        )
+
+        tidx = type_indices[i].item()
+        hard_alpha = F.grid_sample(
+            hard[tidx:tidx + 1], grid,
+            mode="bilinear", padding_mode="zeros", align_corners=True,
+        ).squeeze(0).squeeze(0)
+        soft_alpha = F.grid_sample(
+            soft[tidx:tidx + 1], grid,
+            mode="bilinear", padding_mode="zeros", align_corners=True,
+        ).squeeze(0).squeeze(0)
+
+        hard_alpha = (hard_alpha > 0.5).float()
+        alpha = hard_alpha.detach() + soft_alpha - soft_alpha.detach()
+        alpha = alpha * opacity[i]
+        alpha = torch.clamp(alpha, 0.0, 1.0)
+
+        T_local = T_full[ay0:ay1, ax0:ax1]
+        w = alpha * T_local
+        color_lin = srgb_to_linear(colors[i]).view(3, 1, 1)
+        contrib = w.unsqueeze(0) * color_lin  # [3, aH, aW]
+
+        # Pad to full canvas (autograd-safe, no in-place slice assignment)
+        contrib_padded = F.pad(contrib, (ax0, W - ax1, ay0, H - ay1))
+        C = C + contrib_padded
+
+        T_local_new = T_local * (1.0 - alpha)
+        T_full = T_full.clone()
+        T_full[ay0:ay1, ax0:ax1] = T_local_new
+
+    result = linear_to_srgb(C)
     result = torch.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0)
     return result.clamp(0.0, 1.0)
 
@@ -423,54 +518,44 @@ class STEVectorRenderer(nn.Module):
         """
         Render current shapes to canvas.
 
-        On GPU, uses torch.compile (Triton backend) or Triton STE kernel
-        for acceleration. Falls back to tiled/non-tiled PyTorch otherwise.
+        Uses PyTorch path (reliable, autograd works).
+        Triton tile-based path available but backward needs fixes (see TASKS.md §8.7).
 
-        Args:
-            use_tiling: if None, auto-selects tiled rendering when
-                        canvas >= TILE_THRESHOLD (256px) on either axis.
+        Returns: [3, H, W] rendered image in sRGB [0, 1].
         """
-        # On GPU: try torch.compile (uses Triton backend automatically)
-        if self.device == "cuda":
-            try:
-                if not hasattr(self, "_compiled_forward"):
-                    self._compiled_forward = torch.compile(
-                        self._pytorch_forward, mode="default"
-                    )
-                return self._compiled_forward(use_tiling=use_tiling)
-            except Exception:
-                pass  # Fall through
-
+        # TODO: enable _triton_forward() once Triton backward is fixed
+        # if self.device == "cuda":
+        #     return self._triton_forward()
         return self._pytorch_forward(use_tiling=use_tiling)
 
-    def _pytorch_forward(self, use_tiling: bool = None) -> torch.Tensor:
-        """Pure PyTorch forward path (tiled or non-tiled)."""
-        if use_tiling is None:
-            use_tiling = (
-                self.canvas_height >= TILE_THRESHOLD
-                or self.canvas_width >= TILE_THRESHOLD
-            )
+    def _triton_forward(self) -> torch.Tensor:
+        """Triton tile-based forward: hard alpha Over compositing in linear space."""
+        from .triton_kernels import TritonTileOverSTE
+        bg_linear = srgb_to_linear(self.background)  # [3]
+        # Triton returns [H, W, 3] in linear space
+        rendered_lin = TritonTileOverSTE.apply(
+            self.hard_templates, self.soft_templates, self.type_indices,
+            self.cx, self.cy, self.rx, self.ry, self.angle,
+            self.colors, self.opacity,
+            self.canvas_height, self.canvas_width,
+            bg_linear, TEMPLATE_FILL_RATIO, DEFAULT_TILE_SIZE,
+        )  # [H, W, 3] linear
+        # Convert to sRGB [3, H, W]
+        result = linear_to_srgb(rendered_lin.permute(2, 0, 1))
+        result = torch.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0)
+        return result.clamp(0.0, 1.0)
 
-        if use_tiling:
-            return over_composite_render_tiled(
-                hard_templates=self.hard_templates,
-                soft_templates=self.soft_templates,
-                type_indices=self.type_indices,
-                cx=self.cx, cy=self.cy, rx=self.rx, ry=self.ry, angle=self.angle,
-                colors=self.colors, opacity=self.opacity,
-                canvas_height=self.canvas_height, canvas_width=self.canvas_width,
-                background=self.background, device=self.device,
-            )
-        else:
-            return over_composite_render(
-                hard_templates=self.hard_templates,
-                soft_templates=self.soft_templates,
-                type_indices=self.type_indices,
-                cx=self.cx, cy=self.cy, rx=self.rx, ry=self.ry, angle=self.angle,
-                colors=self.colors, opacity=self.opacity,
-                canvas_height=self.canvas_height, canvas_width=self.canvas_width,
-                background=self.background, device=self.device,
-            )
+    def _pytorch_forward(self, use_tiling: bool = None) -> torch.Tensor:
+        """Pure PyTorch forward path — non-tiled, simplest and most reliable."""
+        return over_composite_render(
+            hard_templates=self.hard_templates,
+            soft_templates=self.soft_templates,
+            type_indices=self.type_indices,
+            cx=self.cx, cy=self.cy, rx=self.rx, ry=self.ry, angle=self.angle,
+            colors=self.colors, opacity=self.opacity,
+            canvas_height=self.canvas_height, canvas_width=self.canvas_width,
+            background=self.background, device=self.device,
+        )
 
     def clamp_params(self):
         """Clamp parameters to valid ranges (called after optimizer step)."""

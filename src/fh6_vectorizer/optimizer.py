@@ -403,34 +403,34 @@ class GradientOptimizer:
                 huber_weight=self.cfg.get("huber_weight", 0.0),
                 grayscale_weight=self.cfg.get("grayscale_weight", 0.0),
             )
-        else:
-            total = torch.tensor(0.0, device=self.device)
-            mse_w = self.cfg.get("mse_weight", 1.0)
-            if mse_w > 0:
-                mse_val = mse_loss(rendered, self.target)
-                total = total + mse_w * mse_val
-                loss_dict["mse"] = mse_val.item()
+            return total, loss_dict
 
-            l1_w = self.cfg.get("l1_weight", 0.0)
-            if l1_w > 0:
-                l1_val = l1_loss(rendered, self.target)
-                total = total + l1_w * l1_val
-                loss_dict["l1"] = l1_val.item()
+        # Build loss from components, ensuring total always has grad_fn
+        mse_w = self.cfg.get("mse_weight", 1.0)
+        l1_w = self.cfg.get("l1_weight", 0.0)
+        huber_w = self.cfg.get("huber_weight", 0.0)
+        gray_w = self.cfg.get("grayscale_weight", 0.0)
 
-            huber_w = self.cfg.get("huber_weight", 0.0)
-            if huber_w > 0:
-                hub_val = huber_loss(rendered, self.target)
-                total = total + huber_w * hub_val
-                loss_dict["huber"] = hub_val.item()
+        # Start with at least MSE to guarantee a differentiable path
+        total = mse_w * mse_loss(rendered, self.target)
+        loss_dict["mse"] = total.item() / max(mse_w, 1e-8)
 
-            gray_w = self.cfg.get("grayscale_weight", 0.0)
-            if gray_w > 0:
-                gray_val = grayscale_mse_loss(rendered, self.target)
-                total = total + gray_w * gray_val
-                loss_dict["grayscale"] = gray_val.item()
+        if l1_w > 0:
+            l1_val = l1_w * l1_loss(rendered, self.target)
+            total = total + l1_val
+            loss_dict["l1"] = l1_val.item()
 
-            loss_dict.setdefault("mse", 0.0)
-            loss_dict.setdefault("perceptual", 0.0)
+        if huber_w > 0:
+            hub_val = huber_w * huber_loss(rendered, self.target)
+            total = total + hub_val
+            loss_dict["huber"] = hub_val.item()
+
+        if gray_w > 0:
+            gray_val = gray_w * grayscale_mse_loss(rendered, self.target)
+            total = total + gray_val
+            loss_dict["grayscale"] = gray_val.item()
+
+        loss_dict.setdefault("perceptual", 0.0)
 
         # Alpha regularization
         alpha_w = self.cfg.get("alpha_reg_weight", 0.0)
@@ -456,9 +456,41 @@ class GradientOptimizer:
         """
         self.optimizer.zero_grad()
 
+        # Ensure params require grad after in-place ops (clamp, relocate)
+        for name in ["cx", "cy", "rx", "ry", "angle", "colors", "opacity"]:
+            p = getattr(self.renderer, name)
+            if not p.requires_grad:
+                p.requires_grad_(True)
+
         rendered = self.renderer()
         loss, loss_dict = self._compute_loss(rendered)
+
+        # Safety check
+        if loss.grad_fn is None:
+            raise RuntimeError(
+                f"Loss has no grad_fn. rendered.grad_fn={rendered.grad_fn}"
+            )
+
         loss.backward()
+
+        # NaN protection: clip gradients and fix NaN param values
+        for name in ["cx", "cy", "rx", "ry", "angle", "colors", "opacity"]:
+            param = getattr(self.renderer, name)
+            if param.grad is not None:
+                # Replace NaN/Inf gradients with zeros
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    param.grad = torch.nan_to_num(
+                        param.grad, nan=0.0, posinf=1.0, neginf=-1.0
+                    )
+                    param.grad.clamp_(-10.0, 10.0)
+
+        # Fix NaN parameter values (shouldn't happen but just in case)
+        for name in ["cx", "cy", "rx", "ry", "angle", "colors", "opacity"]:
+            param = getattr(self.renderer, name)
+            if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                param.data = torch.nan_to_num(
+                    param.data, nan=0.0, posinf=1.0, neginf=0.0
+                )
 
         # Record gradient norms for relocation detection
         grad_norms = {}

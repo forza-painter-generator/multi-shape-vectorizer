@@ -57,7 +57,8 @@ def linear_to_srgb(linear: torch.Tensor) -> torch.Tensor:
     Returns:
         srgb: same shape in [0, 1]
     """
-    linear = linear.clamp(0.0, 1.0)
+    # Clamp to avoid pow backward NaN near 0
+    linear = linear.clamp(min=1e-8, max=1.0)
     low_mask = linear <= 0.0031308
     out = torch.where(
         low_mask,
