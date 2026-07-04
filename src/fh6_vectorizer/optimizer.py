@@ -6,6 +6,13 @@ Implements the optimization loop from vinylizer:
   - Phase B: Scan for "useless" shapes (low gradient + low opacity)
   - Phase C: Relocate useless shapes to high-error regions, freeze old shapes
 
+Features:
+  - Importance-map-weighted shape initialization
+  - Smart color initialization from target image
+  - Smart type selection (try all types at error positions)
+  - Alpha/opacity regularization
+  - Configurable loss composition
+
 Reference: vinylizer/src/core/optimizer.cpp gradient_optimize()
 """
 
@@ -17,8 +24,31 @@ import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from .loss import combined_loss, mse_loss, VGGFeatureExtractor
-from .ste_renderer import STEVectorRenderer
+from .loss import (
+    combined_loss,
+    mse_loss,
+    l1_loss,
+    huber_loss,
+    grayscale_mse_loss,
+    alpha_regularization,
+    VGGFeatureExtractor,
+)
+from .ste_renderer import STEVectorRenderer, over_composite_render
+from .preprocess import (
+    compute_importance_map,
+    importance_weighted_sample,
+    color_from_target,
+)
+
+
+def _flatten_config(config: dict, target: dict, prefix: str = ""):
+    """Flatten nested config dict into flat target dict (e.g., from JSON)."""
+    for key, value in config.items():
+        full_key = f"{prefix}{key}"
+        if isinstance(value, dict) and not key.startswith("_"):
+            _flatten_config(value, target, f"{full_key}_")
+        else:
+            target[key] = value
 
 
 def compute_error_map(
@@ -37,9 +67,13 @@ def compute_error_map(
         error_map: [H, W] per-pixel error
     """
     diff = rendered - target
+    # Handle NaN (can happen with extreme parameter values)
+    diff = torch.nan_to_num(diff, nan=0.0, posinf=1.0, neginf=-1.0)
     # Luminance-weighted: (0.299R + 0.587G + 0.114B)
     lum_weights = torch.tensor([0.299, 0.587, 0.114], device=rendered.device).view(3, 1, 1)
     error = (diff * diff * lum_weights).sum(dim=0)
+    # Clamp to non-negative
+    error = error.clamp(min=0.0)
     return error
 
 
@@ -103,6 +137,8 @@ def relocate_shapes(
     error_map: torch.Tensor,
     relocate_mask: torch.Tensor,
     num_types: int,
+    target: Optional[torch.Tensor] = None,
+    smart_type_selection: bool = False,
 ):
     """
     Relocate useless shapes to high-error positions.
@@ -110,13 +146,16 @@ def relocate_shapes(
     For each relocated shape:
       1. Sample new position from error_map (weighted by error)
       2. Randomize scale and rotation
-      3. Try each template type at the new position
+      3. Optionally: try each template type at the new position (smart selection)
+      4. Optionally: sample colors from target image
 
     Args:
         renderer: the STE renderer
         error_map: [H, W] per-pixel error
         relocate_mask: [N] boolean, which shapes to relocate
         num_types: number of available template types
+        target: [3, H, W] target image (for smart type selection + color init)
+        smart_type_selection: if True, try all types and pick the best
     """
     if not relocate_mask.any():
         return
@@ -126,29 +165,112 @@ def relocate_shapes(
 
     # Flatten error map for weighted sampling
     error_flat = error_map.flatten()
-    error_flat = error_flat / (error_flat.sum() + 1e-8)
+    error_flat = error_flat.clamp(min=0)  # Ensure non-negative
+    error_sum = error_flat.sum()
+    if error_sum < 1e-8:
+        # All errors are zero — uniform sampling
+        error_flat = torch.ones_like(error_flat)
+        error_sum = error_flat.sum()
+    error_flat = error_flat / error_sum
 
     relocate_indices = torch.where(relocate_mask)[0]
     num_reloc = len(relocate_indices)
 
     # Sample new positions
     flat_indices = torch.multinomial(error_flat, num_reloc, replacement=True)
-    new_cy = (flat_indices // W).float()
-    new_cx = (flat_indices % W).float()
+    new_cy = (flat_indices // W).float().to(device)
+    new_cx = (flat_indices % W).float().to(device)
 
     with torch.no_grad():
-        renderer.cx.data[relocate_mask] = new_cx.to(device)
-        renderer.cy.data[relocate_mask] = new_cy.to(device)
-        renderer.rx.data[relocate_mask] = torch.rand(num_reloc, device=device) * 40 + 10
-        renderer.ry.data[relocate_mask] = torch.rand(num_reloc, device=device) * 40 + 10
+        renderer.cx.data[relocate_mask] = new_cx
+        renderer.cy.data[relocate_mask] = new_cy
+        renderer.rx.data[relocate_mask] = torch.rand(num_reloc, device=device) * 30 + 8
+        renderer.ry.data[relocate_mask] = torch.rand(num_reloc, device=device) * 30 + 8
         renderer.angle.data[relocate_mask] = torch.rand(num_reloc, device=device) * 360
-        renderer.colors.data[relocate_mask] = torch.rand(num_reloc, 3, device=device)
         renderer.opacity.data[relocate_mask] = torch.rand(num_reloc, device=device) * 0.3 + 0.3
 
-        # Randomize template types
-        renderer.type_indices.data[relocate_mask] = torch.randint(
-            0, num_types, (num_reloc,), device=device
-        )
+        # Smart color init: sample colors from target at new positions
+        if target is not None:
+            new_colors = color_from_target(target, new_cx, new_cy, noise_std=0.05)
+            renderer.colors.data[relocate_mask] = new_colors.to(device)
+        else:
+            renderer.colors.data[relocate_mask] = torch.rand(num_reloc, 3, device=device)
+
+        # Smart type selection: try all types, pick the one with lowest local MSE
+        if smart_type_selection and target is not None:
+            _select_best_types(
+                renderer, relocate_mask, target, num_types, new_cx, new_cy, device
+            )
+        else:
+            renderer.type_indices.data[relocate_mask] = torch.randint(
+                0, num_types, (num_reloc,), device=device
+            )
+
+
+def _select_best_types(
+    renderer: STEVectorRenderer,
+    relocate_mask: torch.Tensor,
+    target: torch.Tensor,
+    num_types: int,
+    positions_cx: torch.Tensor,
+    positions_cy: torch.Tensor,
+    device: str,
+    patch_size: int = 32,
+):
+    """
+    For each relocated shape, try all template types and pick the best one
+    based on local MSE against the target image.
+
+    This is an expensive but effective way to choose template types.
+
+    Args:
+        renderer: STEVectorRenderer
+        relocate_mask: [N] bool mask
+        target: [3, H, W] target image
+        num_types: number of template types
+        positions_cx, positions_cy: [num_reloc] new positions
+        device: torch device
+        patch_size: size of local patch to compare
+    """
+    relocate_indices = torch.where(relocate_mask)[0]
+    num_reloc = len(relocate_indices)
+    H, W = target.shape[1], target.shape[2]
+    half = patch_size // 2
+
+    for j, global_idx in enumerate(relocate_indices):
+        cx = int(positions_cx[j].item())
+        cy = int(positions_cy[j].item())
+
+        # Extract local target patch
+        y0 = max(0, cy - half)
+        y1 = min(H, cy + half)
+        x0 = max(0, cx - half)
+        x1 = min(W, cx + half)
+        target_patch = target[:, y0:y1, x0:x1]  # [3, ph, pw]
+
+        best_type = 0
+        best_mse = float("inf")
+
+        # Temporarily set position
+        orig_cx = renderer.cx.data[global_idx].clone()
+        orig_cy = renderer.cy.data[global_idx].clone()
+        renderer.cx.data[global_idx] = float(cx)
+        renderer.cy.data[global_idx] = float(cy)
+
+        for t in range(num_types):
+            renderer.type_indices.data[global_idx] = t
+            with torch.no_grad():
+                rendered = renderer()
+                rendered_patch = rendered[:, y0:y1, x0:x1]
+                mse = F.mse_loss(rendered_patch, target_patch).item()
+                if mse < best_mse:
+                    best_mse = mse
+                    best_type = t
+
+        # Restore position (unchanged) and set best type
+        renderer.cx.data[global_idx] = orig_cx
+        renderer.cy.data[global_idx] = orig_cy
+        renderer.type_indices.data[global_idx] = best_type
 
 
 class GradientOptimizer:
@@ -160,6 +282,10 @@ class GradientOptimizer:
         Phase A: Global Adam optimization (all shapes)
         Phase B: Scan for useless shapes
         Phase C: Relocation + local optimization (frozen old shapes)
+
+    Initialization:
+      - Importance-map-weighted position sampling (if enabled)
+      - Color sampling from target image (if enabled)
     """
 
     def __init__(
@@ -167,13 +293,15 @@ class GradientOptimizer:
         renderer: STEVectorRenderer,
         target: torch.Tensor,
         config: Optional[dict] = None,
+        importance_map: Optional[torch.Tensor] = None,
         device: str = "cpu",
     ):
         """
         Args:
             renderer: STEVectorRenderer with optimizable parameters
             target: [3, H, W] target image in [0, 1]
-            config: optimization hyperparameters
+            config: optimization hyperparameters (see configs/default.json)
+            importance_map: [H, W] optional pre-computed importance map
             device: torch device
         """
         self.renderer = renderer
@@ -182,25 +310,44 @@ class GradientOptimizer:
 
         # Default config
         cfg = {
+            # Optimization
             "lr": 0.05,
-            "global_steps": 150,      # Phase A steps per cycle
-            "local_steps": 50,         # Phase C steps per cycle
-            "num_cycles": 3,           # Total A+B+C cycles
+            "color_lr_ratio": 0.5,
+            "global_steps": 150,
+            "local_steps": 50,
+            "num_cycles": 3,
             "relocation_fraction": 0.15,
+            # Loss
             "use_perceptual_loss": False,
-            "perceptual_weight": 0.2,
             "mse_weight": 1.0,
+            "perceptual_weight": 0.2,
+            "l1_weight": 0.0,
+            "huber_weight": 0.0,
+            "grayscale_weight": 0.0,
+            "alpha_reg_weight": 0.0,
+            "alpha_target_mean": 0.5,
+            # Init
+            "use_importance_sampling": True,
+            "smart_color_init": True,
+            "smart_type_selection": False,
         }
         if config:
-            cfg.update(config)
+            # Flatten nested config
+            _flatten_config(config, cfg)
         self.cfg = cfg
+
+        # --- Initialize shapes if importance map is provided ---
+        if importance_map is not None and cfg.get("use_importance_sampling", False):
+            self._init_from_importance(importance_map)
+        if cfg.get("smart_color_init", False):
+            self._init_colors_from_target()
 
         # Optimizer: separate param groups for geometry vs color
         self.optimizer = Adam([
             {"params": [renderer.cx, renderer.cy, renderer.rx, renderer.ry, renderer.angle],
              "lr": cfg["lr"]},
             {"params": [renderer.colors, renderer.opacity],
-             "lr": cfg["lr"] * 0.5},
+             "lr": cfg["lr"] * cfg["color_lr_ratio"]},
         ])
 
         # LR scheduler
@@ -214,21 +361,80 @@ class GradientOptimizer:
 
         self.grad_history = []
 
+    def _init_from_importance(self, importance_map: torch.Tensor):
+        """Initialize shape positions by weighted sampling from importance map."""
+        N = self.renderer.cx.shape[0]
+        cx_new, cy_new = importance_weighted_sample(importance_map, N)
+        with torch.no_grad():
+            self.renderer.cx.data = cx_new.to(self.device)
+            self.renderer.cy.data = cy_new.to(self.device)
+
+    def _init_colors_from_target(self):
+        """Initialize shape colors by sampling from target image."""
+        with torch.no_grad():
+            new_colors = color_from_target(
+                self.target, self.renderer.cx.data, self.renderer.cy.data,
+                noise_std=0.05,
+            )
+            self.renderer.colors.data = new_colors.to(self.device)
+
     def _compute_loss(
         self, rendered: torch.Tensor
     ) -> tuple[torch.Tensor, dict]:
-        """Compute combined loss."""
+        """Compute combined loss with all configured components."""
+        loss_dict = {}
+
         if self.vgg is not None:
-            return combined_loss(
+            total, loss_dict = combined_loss(
                 rendered.unsqueeze(0),
                 self.target.unsqueeze(0),
                 self.vgg,
-                mse_weight=self.cfg["mse_weight"],
-                perceptual_weight=self.cfg["perceptual_weight"],
+                mse_weight=self.cfg.get("mse_weight", 1.0),
+                perceptual_weight=self.cfg.get("perceptual_weight", 0.2),
+                l1_weight=self.cfg.get("l1_weight", 0.0),
+                huber_weight=self.cfg.get("huber_weight", 0.0),
+                grayscale_weight=self.cfg.get("grayscale_weight", 0.0),
             )
         else:
-            mse = mse_loss(rendered, self.target)
-            return mse, {"mse": mse.item(), "perceptual": 0.0}
+            total = torch.tensor(0.0, device=self.device)
+            mse_w = self.cfg.get("mse_weight", 1.0)
+            if mse_w > 0:
+                mse_val = mse_loss(rendered, self.target)
+                total = total + mse_w * mse_val
+                loss_dict["mse"] = mse_val.item()
+
+            l1_w = self.cfg.get("l1_weight", 0.0)
+            if l1_w > 0:
+                l1_val = l1_loss(rendered, self.target)
+                total = total + l1_w * l1_val
+                loss_dict["l1"] = l1_val.item()
+
+            huber_w = self.cfg.get("huber_weight", 0.0)
+            if huber_w > 0:
+                hub_val = huber_loss(rendered, self.target)
+                total = total + huber_w * hub_val
+                loss_dict["huber"] = hub_val.item()
+
+            gray_w = self.cfg.get("grayscale_weight", 0.0)
+            if gray_w > 0:
+                gray_val = grayscale_mse_loss(rendered, self.target)
+                total = total + gray_w * gray_val
+                loss_dict["grayscale"] = gray_val.item()
+
+            loss_dict.setdefault("mse", 0.0)
+            loss_dict.setdefault("perceptual", 0.0)
+
+        # Alpha regularization
+        alpha_w = self.cfg.get("alpha_reg_weight", 0.0)
+        if alpha_w > 0:
+            alpha_val = alpha_regularization(
+                self.renderer.opacity,
+                target_mean=self.cfg.get("alpha_target_mean", 0.5),
+            )
+            total = total + alpha_w * alpha_val
+            loss_dict["alpha_reg"] = alpha_val.item()
+
+        return total, loss_dict
 
     def _optimize_step(self, frozen_mask: Optional[torch.Tensor] = None) -> dict:
         """
@@ -297,10 +503,16 @@ class GradientOptimizer:
             history.append(loss_dict)
 
             if step % 25 == 0 or step == steps - 1:
+                parts = [f"MSE={loss_dict.get('mse', 0):.6f}"]
+                if loss_dict.get('perceptual', 0):
+                    parts.append(f"Perc={loss_dict['perceptual']:.6f}")
+                if loss_dict.get('l1', 0):
+                    parts.append(f"L1={loss_dict['l1']:.6f}")
+                if loss_dict.get('alpha_reg', 0):
+                    parts.append(f"α={loss_dict['alpha_reg']:.6f}")
                 print(
                     f"  Cycle {cycle_idx} {phase} [{step:3d}/{steps}] "
-                    f"MSE={loss_dict['mse']:.6f}"
-                    + (f" Perc={loss_dict['perceptual']:.6f}" if loss_dict['perceptual'] else "")
+                    + " ".join(parts)
                 )
 
         return history
@@ -339,7 +551,9 @@ class GradientOptimizer:
             print(f"    Relocating {num_relocated} shapes")
 
             relocate_shapes(
-                self.renderer, error_map, relocate_mask, num_types
+                self.renderer, error_map, relocate_mask, num_types,
+                target=self.target,
+                smart_type_selection=self.cfg.get("smart_type_selection", False),
             )
 
             # Phase C: Local optimization (frozen old shapes)

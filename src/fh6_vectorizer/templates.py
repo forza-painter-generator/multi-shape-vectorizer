@@ -167,7 +167,7 @@ def build_template_library(
 
 
 def generate_synthetic_templates(
-    num_types: int = 8,
+    num_types: int = 16,
     template_size: int = TEMPLATE_SIZE,
     sigma: float = DEFAULT_SIGMA,
     device: str = "cpu",
@@ -176,7 +176,11 @@ def generate_synthetic_templates(
     Generate synthetic geometric templates (no FH6 data dependency).
     Useful for testing without FH6 resources.
 
-    Produces: circle, square, triangle, ellipse, diamond, star, cross, ring
+    Produces up to 16 shapes:
+      0: circle, 1: square, 2: triangle, 3: ellipse, 4: diamond,
+      5: star5, 6: cross, 7: ring, 8: pentagon, 9: hexagon,
+      10: crescent, 11: heart, 12: arrow_right, 13: droplet,
+      14: chevron, 15: star4
     """
     hard = []
     soft = []
@@ -242,6 +246,93 @@ def generate_synthetic_templates(
     cv2.circle(canvas, (center, center), int(s * 0.45), 1.0, -1)
     cv2.circle(canvas, (center, center), int(s * 0.25), 0.0, -1)
     _make_shape("ring", canvas)
+
+    # 8: Pentagon (regular 5-sided)
+    canvas = np.zeros((s, s), dtype=np.float32)
+    r = int(s * 0.45)
+    pent_pts = []
+    for i in range(5):
+        ang = -math.pi / 2 + i * 2 * math.pi / 5
+        pent_pts.append([int(center + r * math.cos(ang)), int(center + r * math.sin(ang))])
+    cv2.fillPoly(canvas, [np.array(pent_pts, dtype=np.int32)], 1.0)
+    _make_shape("pentagon", canvas)
+
+    # 9: Hexagon (regular 6-sided)
+    canvas = np.zeros((s, s), dtype=np.float32)
+    r = int(s * 0.45)
+    hex_pts = []
+    for i in range(6):
+        ang = i * 2 * math.pi / 6
+        hex_pts.append([int(center + r * math.cos(ang)), int(center + r * math.sin(ang))])
+    cv2.fillPoly(canvas, [np.array(hex_pts, dtype=np.int32)], 1.0)
+    _make_shape("hexagon", canvas)
+
+    # 10: Crescent (moon shape — difference of two offset circles)
+    canvas = np.zeros((s, s), dtype=np.float32)
+    cx1, cy1 = int(s * 0.42), center
+    cx2, cy2 = int(s * 0.58), int(s * 0.55)
+    r_moon = int(s * 0.42)
+    cv2.circle(canvas, (cx1, cy1), r_moon, 1.0, -1)
+    cv2.circle(canvas, (cx2, cy2), r_moon, 0.0, -1)
+    _make_shape("crescent", canvas)
+
+    # 11: Heart
+    canvas = np.zeros((s, s), dtype=np.float32)
+    # Two circles top + triangle bottom
+    r_h = int(s * 0.22)
+    cv2.circle(canvas, (int(s * 0.33), int(s * 0.32)), r_h, 1.0, -1)
+    cv2.circle(canvas, (int(s * 0.67), int(s * 0.32)), r_h, 1.0, -1)
+    heart_pts = np.array([
+        [s * 0.10, s * 0.40], [s * 0.90, s * 0.40],
+        [center, s * 0.92],
+    ], dtype=np.int32)
+    cv2.fillPoly(canvas, [heart_pts], 1.0)
+    _make_shape("heart", canvas)
+
+    # 12: Arrow (right-pointing)
+    canvas = np.zeros((s, s), dtype=np.float32)
+    arrow_pts = np.array([
+        [s * 0.05, s * 0.35], [s * 0.55, s * 0.35],
+        [s * 0.55, s * 0.10], [s * 0.95, center],
+        [s * 0.55, s * 0.90], [s * 0.55, s * 0.65],
+        [s * 0.05, s * 0.65],
+    ], dtype=np.int32)
+    cv2.fillPoly(canvas, [arrow_pts], 1.0)
+    _make_shape("arrow", canvas)
+
+    # 13: Droplet / teardrop
+    canvas = np.zeros((s, s), dtype=np.float32)
+    drop_pts = np.array([
+        [center, s * 0.05],
+        [int(s * 0.85), int(s * 0.55)],
+        [int(s * 0.68), s - 10],
+        [center, int(s * 0.88)],
+        [int(s * 0.32), s - 10],
+        [int(s * 0.15), int(s * 0.55)],
+    ], dtype=np.int32)
+    cv2.fillPoly(canvas, [drop_pts], 1.0)
+    _make_shape("droplet", canvas)
+
+    # 14: Chevron (>> shape)
+    canvas = np.zeros((s, s), dtype=np.float32)
+    chev_pts = np.array([
+        [s * 0.05, s * 0.20], [s * 0.50, center],
+        [s * 0.05, s * 0.80], [s * 0.30, s * 0.80],
+        [s * 0.65, center], [s * 0.30, s * 0.20],
+    ], dtype=np.int32)
+    cv2.fillPoly(canvas, [chev_pts], 1.0)
+    _make_shape("chevron", canvas)
+
+    # 15: Star (4-point / sparkle)
+    canvas = np.zeros((s, s), dtype=np.float32)
+    star4_pts = np.array([
+        [center, s * 0.05], [int(s * 0.58), int(s * 0.38)],
+        [s * 0.95, center], [int(s * 0.58), int(s * 0.62)],
+        [center, s * 0.95], [int(s * 0.42), int(s * 0.62)],
+        [s * 0.05, center], [int(s * 0.42), int(s * 0.38)],
+    ], dtype=np.int32)
+    cv2.fillPoly(canvas, [star4_pts], 1.0)
+    _make_shape("star4", canvas)
 
     # Truncate to requested number
     hard = hard[:num_types]

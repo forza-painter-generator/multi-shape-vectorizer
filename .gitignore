@@ -37,6 +37,7 @@ test_input*.png
 test_output*.png
 result*.png
 *.gif
+*.history.json
 
 # ============================================================
 # IDE / Editor

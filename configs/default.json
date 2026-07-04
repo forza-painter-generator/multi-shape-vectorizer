@@ -1,0 +1,49 @@
+{
+  "_comment": "FH6 Multi-Shape Differentiable Vectorizer — Default Configuration",
+  "_reference": "Adapted from diffbmp/configs/default.json",
+
+  "optimization": {
+    "lr": 0.05,
+    "global_steps": 150,
+    "local_steps": 50,
+    "num_cycles": 3,
+    "relocation_fraction": 0.15,
+    "color_lr_ratio": 0.5
+  },
+
+  "loss": {
+    "use_perceptual_loss": false,
+    "mse_weight": 1.0,
+    "perceptual_weight": 0.2,
+    "l1_weight": 0.0,
+    "huber_weight": 0.0,
+    "grayscale_weight": 0.0,
+    "alpha_reg_weight": 0.0,
+    "alpha_target_mean": 0.5
+  },
+
+  "templates": {
+    "template_size": 128,
+    "sigma": 0.5,
+    "num_types": 16
+  },
+
+  "preprocessing": {
+    "kmeans_k": null,
+    "edge_weight": 0.5,
+    "variance_weight": 0.3,
+    "uniform_weight": 0.2,
+    "color_noise_std": 0.05
+  },
+
+  "initialization": {
+    "use_importance_sampling": true,
+    "smart_color_init": true,
+    "smart_type_selection": false
+  },
+
+  "fh6_output": {
+    "coord_divisor": 1.0,
+    "include_fh6_json": false
+  }
+}

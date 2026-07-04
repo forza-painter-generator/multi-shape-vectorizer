@@ -4,9 +4,12 @@ Main pipeline: ties together template generation, rendering, and optimization.
 Provides a simple API for the full vectorization workflow.
 """
 
+import json
+import math
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -18,6 +21,8 @@ from .templates import (
 )
 from .ste_renderer import STEVectorRenderer
 from .optimizer import GradientOptimizer
+from .preprocess import compute_importance_map
+from .json_writer import generate_fh6_json
 
 
 def load_target_image(
@@ -38,10 +43,23 @@ def load_target_image(
     """
     img = Image.open(path).convert("RGB")
     img = img.resize((target_size[1], target_size[0]), Image.LANCZOS)
-    arr = torch.from_numpy(__import__("numpy").array(img)).float() / 255.0
+    arr = torch.from_numpy(np.array(img)).float() / 255.0
     # HWC → CHW
     arr = arr.permute(2, 0, 1)
     return arr.to(device)
+
+
+def load_config(config_path: Path) -> dict:
+    """
+    Load configuration from a JSON file.
+
+    Args:
+        config_path: path to a JSON config file (e.g., configs/default.json)
+    Returns:
+        config dict
+    """
+    with open(config_path, "r") as f:
+        return json.load(f)
 
 
 def save_output_image(tensor: torch.Tensor, path: Path) -> None:
@@ -122,6 +140,23 @@ def run_pipeline(
     target = load_target_image(target_image_path, target_size=canvas_size, device=device)
     print(f"  Target size: {target.shape}")
 
+    # --- Step 2.5: Compute importance map (for smart initialization) ---
+    importance_map = None
+    use_imp = config.get("use_importance_sampling", True) if config else True
+    if use_imp:
+        print("  Computing importance map...")
+        # Convert target tensor → numpy uint8 for OpenCV
+        target_np = target.cpu().permute(1, 2, 0).numpy()
+        target_np = (target_np * 255).astype(np.uint8)
+        importance_map = compute_importance_map(
+            target_np,
+            edge_weight=config.get("edge_weight", 0.5) if config else 0.5,
+            variance_weight=config.get("variance_weight", 0.3) if config else 0.3,
+            uniform_weight=config.get("uniform_weight", 0.2) if config else 0.2,
+            kmeans_k=config.get("kmeans_k") if config else None,
+        ).to(device)
+        print(f"  Importance map: {importance_map.shape}")
+
     # --- Step 3: Initialize renderer ---
     print(f"\nStep 3: Initializing renderer with {num_shapes} shapes...")
     renderer = STEVectorRenderer(
@@ -140,6 +175,7 @@ def run_pipeline(
         renderer=renderer,
         target=target,
         config=config,
+        importance_map=importance_map,
         device=device,
     )
     history = optimizer.optimize()
@@ -148,13 +184,26 @@ def run_pipeline(
     print("\nStep 5: Rendering final result...")
     final = optimizer.render_final()
 
-    # --- Step 6: Save output ---
+    # --- Step 6: Save outputs ---
     if output_path:
+        # Save rendered image
         save_output_image(final, output_path)
+
+        # Save FH6 JSON if requested
+        if config and config.get("include_fh6_json", False):
+            json_path = output_path.with_suffix(".json")
+            fh6_type_map = library.get("type_map", {i: i for i in range(num_types_actual)})
+            generate_fh6_json(renderer, fh6_type_map, json_path)
+
+        # Save loss history as JSON
+        history_path = output_path.with_suffix(".history.json")
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=2)
+        print(f"Saved loss history to {history_path}")
 
     # Compute final metrics
     mse = torch.nn.functional.mse_loss(final, target).item()
-    psnr = 10 * __import__("math").log10(1.0 / mse) if mse > 0 else float("inf")
+    psnr = 10 * math.log10(1.0 / mse) if mse > 0 else float("inf")
     print(f"\nFinal metrics: MSE={mse:.6f}, PSNR={psnr:.2f} dB")
 
     return final, history

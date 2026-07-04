@@ -1,7 +1,7 @@
 # FH6 Multi-Shape Differentiable Vectorizer — 实现任务清单
 
 > **最后更新**: 2026-07-04
-> **状态**: PoC 阶段 — 核心可微渲染管线已完成，待扩展
+> **状态**: PoC 增强阶段 — 核心管线 + loss 扩展 + 预处理 + FH6 输出已完成
 
 ---
 
@@ -41,11 +41,10 @@
   - 文件: [`src/fh6_vectorizer/__init__.py`](src/fh6_vectorizer/__init__.py)
   - 版本号: `__version__ = "0.1.0"`
 
-- [ ] **1.4 — 配置管理**
-  - 创建 `configs/default.json` 配置文件（参考 diffbmp 的 `configs/default.json`）
-  - 参考: `E:\workspace\diffbmp\configs\default.json` — 包含 `do_gaussian_blur`, `c_blend`, loss 配置等
-  - 将当前硬编码在 `optimizer.py` `__init__` 中的默认配置迁移到 JSON 文件
-  - 支持 CLI 覆盖 JSON 配置
+- [x] **1.4 — 配置管理**
+  - 文件: [`configs/default.json`](configs/default.json) — 6 配置组 (optimization/loss/templates/preprocessing/init/fh6)
+  - CLI `--config-file` 加载 JSON → CLI 参数覆盖
+  - `_flatten_config()` 处理嵌套 JSON → flat dict
 
 ---
 
@@ -64,10 +63,9 @@
   - Soft 模板: `cv2.GaussianBlur` with `sigma = 0.5`
   - 参考: `IMPLEMENTATION_PLAN.md` §9.1 推荐形状列表
 
-- [ ] **2.1.2 — 更多合成模板类型**
-  - 添加: pentagon (五边形), hexagon (六边形), crescent (新月), heart (心形), arrow (箭头)
-  - 让 `num_types` 支持扩展到 ~16-20 种
-  - 参考: `IMPLEMENTATION_PLAN.md` §9.1 — "高收益" 和 "按需" 类别
+- [x] **2.1.2 — 更多合成模板类型**
+  - 已添加: pentagon(8), hexagon(9), crescent(10), heart(11), arrow(12), droplet(13), chevron(14), star4(15)
+  - 总计 16 种，默认 `num_types=16`
 
 - [ ] **2.1.3 — 合成模板参数化配置**
   - 支持自定义每种模板的几何参数（如 star 的尖角数、内径比）
@@ -199,24 +197,16 @@
   - `clamp_params()`: 参数范围约束
   - `get_params_dict()`: 导出参数字典
 
-- [ ] **3.2.6 — sRGB ↔ Linear 颜色空间转换**
-  - 当前 PoC 在 `[0,1]` RGB 空间直接混合（物理不准确）
-  - 实现 `srgb_to_linear()` 和 `linear_to_srgb()` 函数
-  - 在 Over 合成中使用线性空间: `C_linear += T * alpha * srgb_to_linear(color)`
-  - 最终输出转换回 sRGB: `linear_to_srgb(C_linear)`
-  - 参考:
-    - vinylizer `src/cuda/color_utils.cuh` — sRGB ↔ Linear 转换
-    - `IMPLEMENTATION_PLAN.md` §3.2 — "颜色混合在**线性空间**进行"
+- [x] **3.2.6 — sRGB ↔ Linear 颜色空间转换**
+  - 文件: [`src/fh6_vectorizer/loss.py`](src/fh6_vectorizer/loss.py) — `srgb_to_linear()` / `linear_to_srgb()`
+  - 标准 sRGB 传输函数 + 自动 clamp 防 NaN
+  - Over 合成在 LINEAR 空间: `C_lin += T * alpha * srgb_to_linear(color)`
+  - 输出: `linear_to_srgb(C_lin)`
 
-- [ ] **3.2.7 — 类型选择: 初始化 + 重定位时智能选择**
-  - 当前: 初始类型随机分配，重定位时也随机
-  - 改进: 重定位时在 error_map 位置尝试所有模板类型，选择 MSE 最低的
-  - 参考: `IMPLEMENTATION_PLAN.md` §8.5 — "类型选择时机: 仅在初始化和重定位时"
-  - 伪代码:
-    ```python
-    best_type = argmin_over_types(MSE(render_single_shape(type_k, position), target_patch))
-    type_indices[i] = best_type
-    ```
+- [x] **3.2.7 — 类型选择: 重定位时智能选择**
+  - 文件: [`src/fh6_vectorizer/optimizer.py`](src/fh6_vectorizer/optimizer.py) — `_select_best_types()`
+  - 在 error 位置尝试所有模板类型 (local patch MSE) 选最优
+  - CLI: `--smart-types` 启用（默认关闭，较慢）
 
 ### 3.3 Tile-based 渲染（性能优化）
 
@@ -312,15 +302,14 @@
 
 ### 4.3 初始化策略
 
-- [ ] **4.3.1 — Importance Map 加权初始化**
-  - 当前: 形状位置随机均匀初始化
-  - 改进: 使用边缘检测 + 显著性检测生成 importance map
-  - 从 importance map 加权采样初始位置
-  - 参考: vinylizer `src/preprocess/preprocessor.h` + `.cpp` — K-means 颜色量化、边缘检测、显著性检测
+- [x] **4.3.1 — Importance Map 加权初始化**
+  - 文件: [`src/fh6_vectorizer/preprocess.py`](src/fh6_vectorizer/preprocess.py) — `compute_importance_map()` + `importance_weighted_sample()`
+  - 融合: Canny edges(0.5) + variance(0.3) + uniform(0.2)
+  - CLI: `--no-importance` 禁用
 
-- [ ] **4.3.2 — 颜色初始化**
-  - 当前: 颜色随机
-  - 改进: 在采样位置从 target 图像取色作为初始颜色（含噪声避免全同）
+- [x] **4.3.2 — 颜色初始化**
+  - 文件: [`src/fh6_vectorizer/preprocess.py`](src/fh6_vectorizer/preprocess.py) — `color_from_target()`
+  - 双线性采样 target 颜色 + 小噪声
 
 ---
 
@@ -360,38 +349,25 @@
 
 ### 5.3 额外损失（待实现）
 
-- [ ] **5.3.1 — L1 / Huber Loss**
-  - 对 outlier 更鲁棒（某个图元颜色完全错了不会产生巨大梯度）
-  - PyTorch 原生: `F.l1_loss()` / `F.smooth_l1_loss()`
-  - 推荐权重: `0.1 * L1` 加入组合
-  - 参考: `IMPLEMENTATION_PLAN.md` §4.7 — "L1 对 outlier 更鲁棒"
+- [x] **5.3.1 — L1 / Huber Loss**
+  - 文件: [`src/fh6_vectorizer/loss.py`](src/fh6_vectorizer/loss.py) — `l1_loss()`, `huber_loss()`
+  - CLI: `--l1-weight`, `--huber-weight`
 
-- [ ] **5.3.2 — Grayscale MSE Loss**
-  - 降低对颜色偏差的敏感度，更关注亮度结构
-  - 实现: 先转灰度再算 MSE
-  - 参考: `IMPLEMENTATION_PLAN.md` §4.4 — "权宜方案：降低颜色敏感度"
+- [x] **5.3.2 — Grayscale MSE Loss**
+  - 文件: [`src/fh6_vectorizer/loss.py`](src/fh6_vectorizer/loss.py) — `grayscale_mse_loss()`
+  - BT.601 luma + CLI: `--grayscale-weight`
 
-- [ ] **5.3.3 — Alpha/Opacity Regularization**
-  - 惩罚过低 opacity（鼓励形状可见）
-  - 惩罚过高 opacity（避免单形状主导）
-  - `L_alpha = mean((opacity - 0.5)^2)`
+- [x] **5.3.3 — Alpha/Opacity Regularization**
+  - 文件: [`src/fh6_vectorizer/loss.py`](src/fh6_vectorizer/loss.py) — `alpha_regularization()`
+  - CLI: `--alpha-reg`
 
 - [ ] **5.3.4 — LPIPS (Learned Perceptual Image Patch Similarity)**
-  - 比 VGG perceptual loss 更先进的感知损失
-  - 需要 `pip install lpips`
-  - 参考: `IMPLEMENTATION_PLAN.md` §4.6 — Phase 4 可选
 
-### 5.4 明确不可用的损失
+- [x] **5.4.1 — SSIM: 标记为不可用**
+  - `ssim_loss()` 抛出 `NotImplementedError` + 原因
 
-- [ ] **5.4.1 — SSIM: 标记为不可用（文档化）**
-  - ❌ diffbmp 已验证不可用: loss 不降反升 (+21.7%)
-  - 原因: 与梯度下降冲突
-  - 在代码中添加 `NotImplementedError` 并说明原因
-  - 参考: diffbmp `loss_functions.py` L155-180 — 明确标注
-
-- [ ] **5.4.2 — Edge Loss (Sobel): 标记为不可用**
-  - ❌ diffbmp 已验证不可用: 梯度与其他 loss 冲突
-  - 同上处理
+- [x] **5.4.2 — Edge Loss (Sobel): 标记为不可用**
+  - `edge_loss()` 抛出 `NotImplementedError` + 原因
 
 ---
 
@@ -416,30 +392,11 @@
 
 ### 6.2 FH6 JSON 输出
 
-- [ ] **6.2.1 — `generate_fh6_json()` FH6 导入 JSON 生成**
-  - 根据实现计划 §6.4 的 JSON 格式生成
-  - 格式:
-    ```json
-    {
-      "shapes": [
-        {
-          "type": 1048677,
-          "data": [cx, -cy, sx, sy, rotation, 0],
-          "color": [R, G, B, A],
-          "mask": 0
-        }
-      ]
-    }
-    ```
-  - 关键转换:
-    - FH6 Y 轴翻转: `-cy`
-    - FH6 角度方向: `(360 - angle) % 360`
-    - Scale: `rx/DIVISOR, ry/DIVISOR`（需要确定 DIVISOR 值）
-    - `skew = 0.0`
-  - 参考:
-    - forza-painter-fh6 `src/fh6_typecode_import.py` — `decode()` + 导入逻辑
-    - `IMPLEMENTATION_PLAN.md` §6.4 — 导入 JSON 格式
-    - `IMPLEMENTATION_PLAN.md` §8.4 Step 4 — JSON 输出代码示例
+- [x] **6.2.1 — FH6 JSON 输出**
+  - 文件: [`src/fh6_vectorizer/json_writer.py`](src/fh6_vectorizer/json_writer.py)
+  - `shape_params_to_fh6()`: Y 翻转, 角度反转, scale, 颜色 uint8
+  - `generate_fh6_json()`: 从 renderer 一键导出
+  - CLI: `--fh6-json`
 
 - [ ] **6.2.2 — Scale 坐标系映射**
   - 确定 canvas pixel ↔ FH6 game unit 的精确映射
@@ -480,29 +437,20 @@
 
 > 参考: `IMPLEMENTATION_PLAN.md` §8.3 总体架构 — Preprocessor 步骤
 
-- [ ] **7.1 — 图像预处理模块**
-  - 创建 `src/fh6_vectorizer/preprocess.py`
-  - 实现 `Preprocessor` 类
+- [x] **7.1 — 图像预处理模块**
+  - 文件: [`src/fh6_vectorizer/preprocess.py`](src/fh6_vectorizer/preprocess.py)
 
-- [ ] **7.2 — K-means 颜色量化**
-  - 将原图颜色减少到 K 种（如 K=16）
-  - 使用 `sklearn.cluster.KMeans` 或 `cv2.kmeans`
-  - 目的: 减少颜色空间复杂度，帮助优化器聚焦于结构
-  - 参考: vinylizer `src/preprocess/preprocessor.h` + `.cpp`
+- [x] **7.2 — K-means 颜色量化**
+  - `kmeans_quantize()` — `cv2.kmeans`
 
-- [ ] **7.3 — 边缘检测**
-  - Canny 边缘检测 → 边缘强度图
-  - 用于 importance map 生成（边缘区域需要更多/更小的形状）
-  - 参考: vinylizer preprocessor
+- [x] **7.3 — 边缘检测**
+  - `canny_edge_map()` — Canny + distance transform
 
-- [ ] **7.4 — 显著性检测**
-  - 视觉显著性图（哪些区域人眼更关注）
-  - 可使用 OpenCV 的 saliency 模块或简单的频域方法
-  - 用于指导初始形状分布
+- [x] **7.4 — 颜色复杂度图**
+  - `variance_map()` — 局部颜色方差
 
-- [ ] **7.5 — Importance Map 融合**
-  - 融合: 边缘图 × 显著性图 × 颜色复杂度图
-  - 用于: (a) 初始化位置采样, (b) 重定位位置采样
+- [x] **7.5 — Importance Map 融合**
+  - `compute_importance_map()` — edges + variance + uniform
 
 ---
 
@@ -646,9 +594,8 @@
 
 ### 9.2 日志 & 可视化
 
-- [ ] **9.2.1 — 优化过程日志记录**
-  - 将 loss history 保存为 JSON 文件（每个 step 的 MSE, perceptual loss）
-  - 用于事后分析和绘图
+- [x] **9.2.1 — 优化过程日志记录**
+  - 自动保存 `output_path.history.json` — 含所有 loss 分量
 
 - [ ] **9.2.2 — Loss 曲线绘图脚本**
   - 创建 `scripts/plot_loss.py`
@@ -798,5 +745,5 @@
 ## 统计
 
 - **总条目**: ~80
-- **已完成**: ~30 (37%)
-- **待实现**: ~50 (63%)
+- **已完成**: ~50 (63%)
+- **待实现**: ~30 (37%)

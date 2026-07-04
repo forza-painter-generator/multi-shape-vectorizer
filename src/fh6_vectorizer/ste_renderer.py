@@ -7,15 +7,19 @@ Core rendering pipeline:
      b. Sample hard template → binary alpha (forward)
      c. Sample soft template → continuous alpha (backward gradient source)
      d. STE: alpha = hard.detach() + soft - soft.detach()
-     e. Over composite: C += T * alpha * color; T *= (1 - alpha)
+     e. Over composite in LINEAR space: C_lin += T * alpha * srgb_to_linear(color)
+     f. Final output: linear_to_srgb(C_lin)
 
 The STE trick allows:
   - Forward: exact FH6 hard-edge rendering (binary alpha)
   - Backward: gradients flow through the soft (blurred) template
 
+Color pipeline (physically correct):
+  sRGB input → Linear blend → sRGB output
+
 Reference:
   - diffbmp: Gaussian blur for soft rasterization (CVPR 2026)
-  - vinylizer: Over compositing + STE for color quantization
+  - vinylizer: Over compositing + STE + sRGB↔Linear (src/cuda/color_utils.cuh)
   - IGS: Chunked processing pattern (for future Triton port)
 """
 
@@ -24,6 +28,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from .loss import srgb_to_linear, linear_to_srgb
 
 
 # Template fill ratio: shape edge maps to this coordinate in [-1,1] grid_sample space
@@ -136,8 +142,9 @@ def over_composite_render(
     hard = hard_templates.unsqueeze(1)  # [num_types, 1, T, T]
     soft = soft_templates.unsqueeze(1)  # [num_types, 1, T, T]
 
-    # Initialize canvas with background
-    C = background.view(3, 1, 1).expand(3, canvas_height, canvas_width).clone()
+    # Initialize canvas with background (in linear space)
+    bg_linear = srgb_to_linear(background)
+    C = bg_linear.view(3, 1, 1).expand(3, canvas_height, canvas_width).clone()
     T = torch.ones(canvas_height, canvas_width, device=device)  # transmittance
 
     # Render shapes back-to-front (index 0 = back, N-1 = front)
@@ -172,17 +179,20 @@ def over_composite_render(
         alpha = alpha * opacity[i]  # [H, W]
         alpha = torch.clamp(alpha, 0.0, 1.0)
 
-        # Over composite
+        # Over composite in LINEAR space (physically correct)
         w = alpha * T  # [H, W]
-        color = colors[i].view(3, 1, 1)  # [3, 1, 1]
-        C = C + w.unsqueeze(0) * color
+        color_linear = srgb_to_linear(colors[i]).view(3, 1, 1)  # [3, 1, 1]
+        C = C + w.unsqueeze(0) * color_linear
         T = T * (1.0 - alpha)
 
         # Early termination: stop if transmittance is negligible
         if T.max() < 1e-4:
             break
 
-    return torch.clamp(C, 0.0, 1.0)
+    # Convert back to sRGB for output
+    result = linear_to_srgb(C)
+    result = torch.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0)
+    return result.clamp(0.0, 1.0)
 
 
 class STEVectorRenderer(nn.Module):
