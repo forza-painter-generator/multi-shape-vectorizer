@@ -86,6 +86,7 @@ def run_pipeline(
     use_fh6_data: bool = False,
     fh6_vinyls_root: Optional[Path] = None,
     template_cache_path: Optional[Path] = None,
+    snapshot_dir: Optional[Path] = None,
     config: Optional[dict] = None,
     device: str = "cpu",
 ) -> tuple[torch.Tensor, list[dict]]:
@@ -101,6 +102,7 @@ def run_pipeline(
         use_fh6_data: whether to use real FH6 shape data
         fh6_vinyls_root: path to FH6 Vinyls/ directory
         template_cache_path: path to cache/load pre-built templates
+        snapshot_dir: if set, save intermediate renders here every N steps
         config: optimizer hyperparameters
         device: "cpu" or "cuda"
 
@@ -177,6 +179,8 @@ def run_pipeline(
         config=config,
         importance_map=importance_map,
         device=device,
+        snapshot_dir=str(snapshot_dir) if snapshot_dir else None,
+        snapshot_interval=config.get("snapshot_interval", 25) if config else 25,
     )
     history = optimizer.optimize()
 

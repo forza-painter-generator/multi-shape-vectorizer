@@ -407,6 +407,58 @@ def test_alpha_reg_target():
 
 
 # ============================================================
+# Perceptual loss
+# ============================================================
+
+def test_perceptual_loss_identical():
+    """Perceptual loss should be ~0 for identical images."""
+    try:
+        from fh6_vectorizer.loss import VGGFeatureExtractor, perceptual_loss
+    except ImportError:
+        print("  test_perceptual_loss_identical SKIP (no torchvision)")
+        return
+
+    vgg = VGGFeatureExtractor(device="cpu")
+    x = torch.rand(1, 3, 64, 64)
+    loss = perceptual_loss(x, x, vgg)
+    assert loss.item() < 1e-3, f"Perceptual loss for identical images: {loss.item()}"
+    print("  test_perceptual_loss_identical PASS")
+
+
+def test_perceptual_loss_different():
+    """Perceptual loss should be > 0 for different images."""
+    try:
+        from fh6_vectorizer.loss import VGGFeatureExtractor, perceptual_loss
+    except ImportError:
+        print("  test_perceptual_loss_different SKIP (no torchvision)")
+        return
+
+    vgg = VGGFeatureExtractor(device="cpu")
+    x = torch.ones(1, 3, 64, 64) * 0.5
+    y = torch.zeros(1, 3, 64, 64)
+    loss = perceptual_loss(x, y, vgg)
+    assert loss.item() > 0, "Perceptual loss should be >0 for different images"
+    print(f"  test_perceptual_loss_different PASS (loss={loss.item():.4f})")
+
+
+def test_vgg_shape():
+    """VGGFeatureExtractor should produce correct feature shape."""
+    try:
+        from fh6_vectorizer.loss import VGGFeatureExtractor
+    except ImportError:
+        print("  test_vgg_shape SKIP (no torchvision)")
+        return
+
+    vgg = VGGFeatureExtractor(device="cpu")
+    x = torch.rand(1, 3, 128, 128)
+    feat = vgg(x)
+    # relu3_3 should have spatial dims roughly H/4 × W/4
+    assert feat.shape[0] == 1, f"Batch dim: {feat.shape}"
+    assert feat.shape[2] >= 28 and feat.shape[3] >= 28, f"Spatial dims: {feat.shape}"
+    print(f"  test_vgg_shape PASS (features: {feat.shape})")
+
+
+# ============================================================
 # Run all
 # ============================================================
 
@@ -426,6 +478,9 @@ if __name__ == "__main__":
         test_error_map,
         test_all_losses_zero_for_identical,
         test_alpha_reg_target,
+        test_perceptual_loss_identical,
+        test_perceptual_loss_different,
+        test_vgg_shape,
     ]
 
     passed = 0

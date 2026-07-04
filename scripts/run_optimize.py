@@ -82,6 +82,8 @@ def main():
                         help="Path to JSON config file (e.g., configs/default.json)")
     parser.add_argument("--fh6-json", action="store_true",
                         help="Generate FH6-compatible JSON output")
+    parser.add_argument("--snapshot-dir", type=str, default=None,
+                        help="Save intermediate renders to this directory every N steps")
 
     # Device
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
@@ -140,6 +142,7 @@ def main():
         use_fh6_data=args.fh6_data is not None,
         fh6_vinyls_root=Path(args.fh6_data) if args.fh6_data else None,
         template_cache_path=Path(args.template_cache) if args.template_cache else None,
+        snapshot_dir=Path(args.snapshot_dir) if args.snapshot_dir else None,
         config=config,
         device=args.device,
     )

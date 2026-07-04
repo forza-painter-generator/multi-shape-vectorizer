@@ -17,6 +17,7 @@ Reference: vinylizer/src/core/optimizer.cpp gradient_optimize()
 """
 
 import math
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -295,6 +296,8 @@ class GradientOptimizer:
         config: Optional[dict] = None,
         importance_map: Optional[torch.Tensor] = None,
         device: str = "cpu",
+        snapshot_dir: Optional[str] = None,
+        snapshot_interval: int = 50,
     ):
         """
         Args:
@@ -303,10 +306,15 @@ class GradientOptimizer:
             config: optimization hyperparameters (see configs/default.json)
             importance_map: [H, W] optional pre-computed importance map
             device: torch device
+            snapshot_dir: if set, save intermediate renders to this dir every N steps
+            snapshot_interval: save snapshot every N global steps
         """
         self.renderer = renderer
         self.target = target.to(device)
         self.device = device
+        self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else None
+        self.snapshot_interval = snapshot_interval
+        self._global_step_counter = 0
 
         # Default config
         cfg = {
@@ -477,7 +485,29 @@ class GradientOptimizer:
         if len(self.grad_history) > 50:
             self.grad_history.pop(0)
 
+        # Save intermediate snapshot if configured
+        if (
+            frozen_mask is None
+            and self.snapshot_dir is not None
+            and self._global_step_counter % self.snapshot_interval == 0
+        ):
+            self._save_snapshot(self._global_step_counter, loss_dict)
+
+        self._global_step_counter += 1
         return loss_dict
+
+    def _save_snapshot(self, step: int, loss_dict: dict):
+        """Save an intermediate render snapshot to disk."""
+        from PIL import Image
+        import numpy as np
+
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        with torch.no_grad():
+            rendered = self.renderer()
+        arr = rendered.detach().cpu().permute(1, 2, 0).numpy()
+        arr = (arr.clip(0, 1) * 255).astype(np.uint8)
+        path = self.snapshot_dir / f"step_{step:05d}_mse_{loss_dict.get('mse', 0):.6f}.png"
+        Image.fromarray(arr).save(path)
 
     def run_cycle(
         self,
