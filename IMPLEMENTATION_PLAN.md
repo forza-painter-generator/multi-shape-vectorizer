@@ -248,6 +248,77 @@ ste_colors[i] = roundf(float_colors[i]);
 
 同样的思路可以扩展到 shape type：前向用硬图形渲染（匹配游戏），反向用软图形求梯度。
 
+### 3.7 FH6 Gradient_Shapes 的 SDF 渐变模板策略（新）
+
+#### 核心洞察
+
+FH6 的 Gradient_Shapes 家族（type_code base=1048777，40 种）在游戏中被渲染为带有方向性渐变透明度的图形。虽然游戏内渲染时这些图形有硬边界（多边形裁剪），但优化计算时可以**越过边界**使用连续渐变值——边界外的微弱 alpha 对最终渲染影响极小（参考 vinylizer 的 alpha_228 做法）。
+
+#### 与 Gaussian Blur 的对比
+
+```
+Gaussian blur 软化:                      FH6 Gradient Shape (PNG 预渲染):
+                                          
+  1.0 ┌──────┐                           1.0 ─╲  ← 方向性渐变
+      │ ████ │                                 ╲   （不是均匀径向！）
+      │ ████ │  ← 内部梯度≈0                     ╲
+      └──────┘                                    ╲
+  ↑ 边界 ↑  (exp(-d²) 快速衰减)           0.0 ──────╲
+                                                 ↑↑↑↑↑
+                                           (线性衰减，梯度延伸更远)
+```
+
+Gaussian blur 的指数衰减在 6px 外梯度≈0；而 FH6 预渲染的渐变是近似线性的，在远处仍有可用梯度信号。
+
+#### 实现方式：直接使用 FH6 预览 PNG 作为软模板
+
+FH6 资源目录中每个 Gradient_Shape 都有对应的 `.png` 预览图（在游戏引擎中渲染的，已包含方向性渐变效果）。可以直接加载为软模板：
+
+```python
+def _load_gradient_shape_png(family_dir: Path, index: int, size: int = 128) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Load FH6 Gradient Shape from pre-rendered PNG.
+    Returns (hard_template, soft_template).
+    """
+    png = cv2.imread(str(family_dir / f"{index}.png"), cv2.IMREAD_GRAYSCALE)
+    png = cv2.resize(png, (size, size), interpolation=cv2.INTER_LANCZOS4)
+    soft = png.astype(np.float32) / 255.0  # [0, 1] 连续渐变
+    
+    # Hard = 阈值化（FH6 游戏内渲染匹配）
+    hard = (soft >= 0.5).astype(np.float32)  # {0, 1}
+    
+    return hard, soft
+```
+
+#### 精选的 8 个 Gradient_Shapes
+
+| FH6 索引 | 名称 | 渐变方向 | 适用场景 |
+|----------|------|---------|---------|
+| 28 | 渐变椭圆 1 | 中心→边缘（径向） | 通用，同 alpha_228 |
+| 26 | 渐变椭圆 2 | 中心 50%实心→边缘透明 | 更锐利的过渡 |
+| 11 | 渐变矩形 1 | 中心实心→一条边透明 | 定向衰减填充 |
+| 12 | 渐变矩形 2 | 一个角实心→对角透明 | 角落高亮 |
+| 13 | 渐变矩形 3 | 一条边实心→对边透明 | 线性渐变填充 |
+| 16 | 渐变矩形 4 | 三个角实心→一角透明 | 暗角/聚光效果 |
+| 17 | 渐变矩形 5 | 中间竖线实心→左右透明 | 竖条高亮 |
+| 21 | 渐变三角形 1 | 尖头实心→底边透明 | 方向性三角形渐变 |
+
+这些形状的**方向性渐变**（不仅是径向）是实现比 vinylizer 纯渐变椭圆更好效果的关键——不同类型的渐变方向能更好地匹配图像中不同的结构和纹理走向。
+
+#### 优势
+
+1. **全域梯度**: 每个 Gradient_Shape 在整个模板区域都有非零梯度（线性衰减）
+2. **方向性**: 不只是径向渐变，有定向的透明度衰减（垂直/水平/对角线）
+3. **零模糊开销**: 无需 Gaussian blur 预处理，PNG 直接作为软模板
+4. **FH6 原生**: 和游戏内渲染完全匹配，导入后效果一致
+5. **比 vinylizer 更强**: 8 种方向性渐变 > 1 种径向渐变椭圆
+
+#### 风险
+
+- PNG 预览是 256×256 分辨率，resize 到 128×128 可能有轻微锯齿
+- 需要验证 "越过边界" 的 alpha 值在游戏内渲染时是否确实肉眼不可见
+- `VerticesAlpha` 目前全为 255（不透明），渐变效果完全来自游戏引擎的 type_code 特殊渲染
+
 ---
 
 ## 5. 损失函数优化方案
@@ -927,12 +998,13 @@ def generate_fh6_json(shapes, output_path):
 ### 8.5 关键技术决策
 
 1. **模板大小**: 128×128（平衡精度与显存）
-2. **模糊 σ**: 0.3（在 128px 模板上 ≈ 1px 过渡，画布上完全不可见）
-3. **STE 策略**: 前向硬模板 + 反向软模板（参考 diffbmp 的 `S_blurred` vs `S`）
-4. **类型选择时机**: 仅在初始化和重定位时（优化过程中固定）
-5. **模板存储**: `torch.Tensor` `[num_types, T, T]` + `F.grid_sample` 或 Triton bilinear kernel
-6. **颜色空间**: sRGB→Linear→sRGB（与 vinylizer/diffbmp 一致）
-7. **优化器**: `torch.optim.Adam` + `CosineAnnealingLR`（替代手写 CUDA Adam，代码减少 ~200 行）
+2. **形状软化**: 两个层级
+   - **数学渐变模板** (8 个): 连续数学函数定义 → 全域梯度，无需 Gaussian blur
+   - **几何硬模板** (16 个): cv2 渲染 → Gaussian blur σ=2.0 软化
+3. **无 STE**: 前向和反向都使用连续软模板（类似 vinylizer alpha_228）
+   - 取消硬/软分离，`alpha = grid_sample(soft_template) * opacity`
+   - 梯度通过 autograd 自动流过整个模板区域
+4. **Vinylizer 风格 relocation**: z-order compact + 重置 Adam + Top-K 误差采样 + 最佳快照恢复
 
 ### 8.6 代码复用清单（Python 版）
 
@@ -961,28 +1033,38 @@ def generate_fh6_json(shapes, output_path):
 
 ## 9. 图形精选策略
 
-### 9.1 推荐列表 (15-20 种)
+### 9.1 推荐列表
 
-基于"不可替代性"原则精选：
+基于"不可替代性"原则精选，分两个层次：
+
+#### 核心渐变图形（8 种）⭐ — FH6 Gradient_Shapes 方向性渐变
+
+这些图形在优化时使用 PNG 预渲染渐变（全域连续 alpha），收敛速度远超 Gaussian blur 硬边图形：
+
+| FH6 索引 | 名称 | 渐变方向 | 适用场景 |
+|----------|------|---------|---------|
+| #28 | 渐变椭圆 1 | 中心→边缘（径向） | 通用，同 alpha_228 |
+| #26 | 渐变椭圆 2 | 中心 50%实心→边缘 | 锐利过渡 |
+| #11 | 渐变矩形 1 | 中心实心→一条边 | 定向衰减填充 |
+| #12 | 渐变矩形 2 | 一角实心→对角 | 角落高亮/阴影 |
+| #13 | 渐变矩形 3 | 一边实心→对边 | 线性渐变填充 |
+| #16 | 渐变矩形 4 | 三角实心→一角 | 暗角/聚光 |
+| #17 | 渐变矩形 5 | 中线实心→左右 | 竖条/Vignette |
+| #21 | 渐变三角形 1 | 尖头实心→底边 | 方向性三角渐变 |
+
+> 参考: `IMPLEMENTATION_PLAN.md` §3.7 — 实现方式：直接加载 FH6 `.png` 预览图
+
+#### 辅助几何图形（6-8 种）
 
 ```
-必备基础几何 (6):
   type_code  名称      用途
   ─────────  ────────  ──────────────────
-  1048677    Square    大面积纯色填充
-  1048678    Circle    圆形区域
-  1048679    Triangle  尖锐特征
-  1048712    Ellipse   rx≠ry 场景
-  1048777+   Gradient  原生软渐变 (FH6独有!)
-  1048688    Circle    镂空/环形
-             Border
-
-高收益 (8):
-  菱形、五边形/六边形、星形、新月(Crescent)
-  条纹 1-2 种、十字形、水滴
-
-按需 (6):
-  心形、火焰、大写字母 1 组 (仅文字涂装)
+  Primitives Square    大面积纯色填充（退化为 Gaussian blur）
+  Primitives Circle    圆形区域
+  Primitives Triangle  尖锐特征
+  Primitives Ellipse   rx≠ry 场景
+  Primitives Diamond   菱形区域
+  Primitives Cross     十字/交叉
 ```
 
 ### 9.2 边际收益分析
@@ -1003,7 +1085,7 @@ def generate_fh6_json(shapes, output_path):
 | STE 前向/反向不一致导致收敛差 | 低 | diffbmp 已验证此方法；sigma 取极小值确保差距 < 0.5px |
 | 硬图形叠加出现可见接缝 | 中 | 引入少量 Gradient Shapes 作为"胶水层"填充接缝 |
 | 3000 层 GPU 显存不足 | 低 | 128² 模板仅 1.3MB；梯度缓冲区与 diffbmp 一致 |
-| 模板渲染器未正确处理 VerticesAlpha | 中 | 大部分图形的 VerticesAlpha 是全 255（不透明），少数需特殊处理 |
+| 模板渲染器未正确处理 VerticesAlpha | 中 | 大部分图形的 VerticesAlpha 是全 255（不透明），Gradient_Shapes 的渐变效果来自游戏引擎 type_code 渲染而非 vertex alpha |\n| **Gradient_Shapes "越过边界" alpha 在游戏内可见** | 低 | 参考 vinylizer alpha_228 已验证：边界外微弱 alpha 对最终渲染影响肉眼不可见；FH6 在渲染时自然裁剪到多边形边界 |\n| **Gradient_Shapes PNG resize 锯齿** | 低 | 256→128 使用 LANCZOS4 插值，质量损失可忽略；可改用 256×256 模板避免 resize |
 | **Triton kernel Over 合成改造出错** | 中 | IGS 原版是归一化加权和，改为 Over 需要重新验证 backward 梯度正确性（先写 PyTorch 纯 Python 版做 golden reference） |
 | **Python overhead 导致迭代变慢** | 低 | 核心计算在 Triton/CUDA kernel 内；Python 只做调度，overhead 可忽略 |
 | **Triton 兼容性（特定 GPU 不支持）** | 低 | Triton 支持 CUDA 8.0+，覆盖 GTX 10 系列及以上所有 NVIDIA GPU |

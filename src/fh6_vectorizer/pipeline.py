@@ -205,8 +205,12 @@ def run_pipeline(
 
     # --- Step 6: Save outputs ---
     if output_path:
-        # Save rendered image
-        save_output_image(final, output_path)  # RGB only, no alpha mask
+        # Save rendered image with alpha channel
+        final_rgba = optimizer.renderer(return_alpha=True)
+        # Split RGB + A
+        final_rgb = final_rgba[:3]
+        final_alpha = final_rgba[3:4]  # [1, H, W]
+        save_output_image(final_rgb, output_path, alpha_mask=final_alpha)
 
         # Save FH6 JSON if requested
         if config and config.get("include_fh6_json", False):

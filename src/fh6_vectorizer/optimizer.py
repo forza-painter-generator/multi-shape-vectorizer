@@ -85,63 +85,47 @@ def compute_error_map(
 def find_relocation_candidates(
     renderer: STEVectorRenderer,
     grad_history: list[dict],
-    relocation_fraction: float = 0.15,
-    min_opacity: float = 0.05,
-    grad_threshold_quantile: float = 0.25,
-) -> torch.Tensor:
+    stability_threshold: float = 1.0,
+    min_visibility: float = 2.0,
+) -> tuple[torch.Tensor, int, int, int]:
     """
-    Identify shapes that are "useless" and should be relocated.
+    Vinylizer-style: classify shapes by gradient stability + visibility.
 
-    Criteria:
-      1. Low gradient norm (converged, not contributing much)
-      2. Low opacity (barely visible or fully occluded)
-
-    Args:
-        renderer: the STE renderer
-        grad_history: list of gradient norm dicts from recent steps
-        relocation_fraction: fraction of total shapes to relocate
-        min_opacity: opacity below which shape is considered useless
-        grad_threshold_quantile: quantile for gradient norm threshold
-
-    Returns:
-        Boolean mask [N] — True for shapes to relocate
+    Returns (relocate_mask, n_useful, n_useless, n_unstable).
+    Only relocates shapes that are BOTH stable AND useless (low visibility).
     """
     N = renderer.cx.shape[0]
-    num_to_relocate = max(1, int(N * relocation_fraction))
+    device = renderer.device
 
-    # Compute average gradient norm from history
-    if len(grad_history) > 0:
-        avg_grad = torch.zeros(N, device=renderer.device)
-        for h in grad_history:
-            for k, v in h.items():
-                avg_grad += v.detach()
-        avg_grad /= len(grad_history)
-    else:
-        avg_grad = torch.ones(N, device=renderer.device)
+    # Compute mean gradient norm from history
+    if len(grad_history) < 3:
+        return (torch.zeros(N, dtype=torch.bool, device=device), N, 0, 0)
 
-    # Score: lower is more "useless"
-    # Combine gradient norm and opacity
-    opacity = renderer.opacity.data
-    grad_score = avg_grad / (avg_grad.max() + 1e-8)
-    opacity_score = opacity / (opacity.max() + 1e-8)
-    usefulness = grad_score * 0.5 + opacity_score * 0.5
+    avg_grad = torch.zeros(N, device=device)
+    for h in grad_history:
+        for v in h.values():
+            avg_grad += v.detach()
+    avg_grad /= len(grad_history)
 
-    # Select lowest-scoring shapes
-    _, indices = torch.sort(usefulness)
-    relocate_mask = torch.zeros(N, dtype=torch.bool, device=renderer.device)
-    relocate_mask[indices[:num_to_relocate]] = True
+    # Stability: low mean gradient = converged
+    is_stable = avg_grad < stability_threshold
 
-    # Also relocate shapes with very low opacity
-    relocate_mask = relocate_mask | (opacity < min_opacity)
+    # Visibility: use opacity × area as proxy for actual blend weight
+    # (full per-pixel visibility requires renderer changes)
+    with torch.no_grad():
+        area_proxy = (renderer.rx.data * renderer.ry.data).sqrt()
+        visibility = renderer.opacity.data * area_proxy
+        # Normalize to reasonable range
+        vis_max = visibility.max() + 1e-8
+        visibility = visibility / vis_max * 10.0  # scale to ~[0, 10]
 
-    # Also relocate shapes with near-zero opacity (wasted resources)
-    dead_opacity = opacity < 0.02
-    relocate_mask = relocate_mask | dead_opacity
-    num_dead = dead_opacity.sum().item()
-    if num_dead > 0:
-        print(f"    Recycling {num_dead} dead (opacity≈0) shapes")
+    n_unstable = (~is_stable).sum().item()
+    n_useful = (is_stable & (visibility >= min_visibility)).sum().item()
+    n_useless = (is_stable & (visibility < min_visibility)).sum().item()
 
-    return relocate_mask
+    relocate_mask = is_stable & (visibility < min_visibility)
+
+    return relocate_mask, n_useful, n_useless, n_unstable
 
 
 def relocate_shapes(
@@ -150,73 +134,74 @@ def relocate_shapes(
     relocate_mask: torch.Tensor,
     num_types: int,
     target: Optional[torch.Tensor] = None,
-    smart_type_selection: bool = False,
-):
+) -> torch.Tensor:
     """
-    Relocate useless shapes to high-error positions.
+    Vinylizer-style: z-order compact + Top-K error sampling.
 
-    For each relocated shape:
-      1. Sample new position from error_map (weighted by error)
-      2. Randomize scale and rotation
-      3. Optionally: try each template type at the new position (smart selection)
-      4. Optionally: sample colors from target image
-
-    Args:
-        renderer: the STE renderer
-        error_map: [H, W] per-pixel error
-        relocate_mask: [N] boolean, which shapes to relocate
-        num_types: number of available template types
-        target: [3, H, W] target image (for smart type selection + color init)
-        smart_type_selection: if True, try all types and pick the best
+    1. Remove relocated shapes, shift remaining forward
+    2. Sample new positions from top-5% highest error pixels
+    3. Append new shapes at end (top z-order layer)
+    4. Returns new_indices mask for Phase C local optimization
     """
     if not relocate_mask.any():
-        return
+        return torch.zeros_like(relocate_mask)
 
     H, W = error_map.shape
+    N = renderer.cx.shape[0]
     device = renderer.device
-
-    # Flatten error map for weighted sampling
-    error_flat = error_map.flatten()
-    error_flat = error_flat.clamp(min=0)  # Ensure non-negative
-    error_sum = error_flat.sum()
-    if error_sum < 1e-8:
-        # All errors are zero — uniform sampling
-        error_flat = torch.ones_like(error_flat)
-        error_sum = error_flat.sum()
-    error_flat = error_flat / error_sum
-
     relocate_indices = torch.where(relocate_mask)[0]
     num_reloc = len(relocate_indices)
 
-    # Sample new positions
-    flat_indices = torch.multinomial(error_flat, num_reloc, replacement=True)
-    new_cy = (flat_indices // W).float().to(device)
-    new_cx = (flat_indices % W).float().to(device)
-
     with torch.no_grad():
-        renderer.cx.data[relocate_mask] = new_cx
-        renderer.cy.data[relocate_mask] = new_cy
-        renderer.rx.data[relocate_mask] = torch.rand(num_reloc, device=device) * 30 + 8
-        renderer.ry.data[relocate_mask] = torch.rand(num_reloc, device=device) * 30 + 8
-        renderer.angle.data[relocate_mask] = torch.rand(num_reloc, device=device) * 360
-        renderer.opacity.data[relocate_mask] = torch.rand(num_reloc, device=device) * 0.3 + 0.3
+        # --- Top-K error sampling (vinylizer: sample from top 5%) ---
+        error_flat = error_map.flatten()
+        K = max(num_reloc * 5, min(50, int(error_flat.numel() * 0.05)))
+        _, top_indices = torch.topk(error_flat, K)
+        rand_k = torch.randint(0, K, (num_reloc,), device=device)
+        flat_idx = top_indices[rand_k]
+        new_cy = (flat_idx // W).float()
+        new_cx = (flat_idx % W).float()
 
-        # Smart color init: sample colors from target at new positions
+        # New params
+        new_rx = torch.rand(num_reloc, device=device) * 30 + 5
+        new_ry = torch.rand(num_reloc, device=device) * 30 + 5
+        new_angle = torch.rand(num_reloc, device=device) * 360
+        new_opacity = torch.ones(num_reloc, device=device)  # full opacity initially
+        new_type = torch.randint(0, num_types, (num_reloc,), device=device)
+
         if target is not None:
             new_colors = color_from_target(target, new_cx, new_cy, noise_std=0.05)
-            renderer.colors.data[relocate_mask] = new_colors.to(device)
         else:
-            renderer.colors.data[relocate_mask] = torch.rand(num_reloc, 3, device=device)
+            new_colors = torch.rand(num_reloc, 3, device=device)
 
-        # Smart type selection: try all types, pick the one with lowest local MSE
-        if smart_type_selection and target is not None:
-            _select_best_types(
-                renderer, relocate_mask, target, num_types, new_cx, new_cy, device
-            )
-        else:
-            renderer.type_indices.data[relocate_mask] = torch.randint(
-                0, num_types, (num_reloc,), device=device
-            )
+        # --- z-order compact: remove relocated, shift forward ---
+        keep_mask = ~relocate_mask
+        num_keep = keep_mask.sum().item()
+
+        for name in ["cx", "cy", "rx", "ry", "angle", "colors", "opacity", "type_indices"]:
+            param = getattr(renderer, name)
+            data = param.data
+            # Compact: keep shapes shift to front
+            if data.ndim == 1:
+                data[:num_keep] = data[keep_mask]
+            else:  # colors: [N, 3]
+                data[:num_keep] = data[keep_mask]
+
+        # --- Append new shapes at end (top z-order) ---
+        base = num_keep
+        renderer.cx.data[base:base + num_reloc] = new_cx
+        renderer.cy.data[base:base + num_reloc] = new_cy
+        renderer.rx.data[base:base + num_reloc] = new_rx
+        renderer.ry.data[base:base + num_reloc] = new_ry
+        renderer.angle.data[base:base + num_reloc] = new_angle
+        renderer.opacity.data[base:base + num_reloc] = new_opacity
+        renderer.colors.data[base:base + num_reloc] = new_colors
+        renderer.type_indices.data[base:base + num_reloc] = new_type
+
+    # Return mask of new shapes (indices base..N-1)
+    new_indices = torch.zeros(N, dtype=torch.bool, device=device)
+    new_indices[base:base + num_reloc] = True
+    return new_indices
 
 
 def _select_best_types(
@@ -345,6 +330,10 @@ class GradientOptimizer:
             "global_steps": 150,
             "local_steps": 50,
             "num_cycles": 3,
+            # Vinylizer-style relocation
+            "reloc_stability_threshold": 1.0,
+            "reloc_min_visibility": 0.5,
+            # Legacy (deprecated)
             "relocation_fraction": 0.15,
             # Loss
             "use_perceptual_loss": False,
@@ -680,16 +669,29 @@ class GradientOptimizer:
             for n, v in snapshot.items():
                 getattr(self.renderer, n).data.copy_(v)
 
+    def _reset_optimizer(self):
+        """Reset Adam state + scheduler after relocation (z-order changed)."""
+        r = self.renderer
+        self.optimizer = Adam([
+            {"params": [r.cx, r.cy, r.rx, r.ry, r.angle],
+             "lr": self.cfg["lr"]},
+            {"params": [r.colors, r.opacity],
+             "lr": self.cfg["lr"] * self.cfg["color_lr_ratio"]},
+        ])
+        total_steps = self.cfg["num_cycles"] * (self.cfg["global_steps"] + self.cfg["local_steps"])
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
+        self.grad_history = []
+
     def optimize(self) -> list[dict]:
         """
-        Run full optimization pipeline.
+        Vinylizer-style optimization with best-cycle snapshot.
 
-        Returns:
-            Full loss history across all cycles
+        No rollback — runs all cycles, saves best MSE snapshot per cycle.
         """
         full_history = []
         num_types = self.renderer.hard_templates.shape[0]
-        rollback_threshold = self.cfg.get("relocation_rollback_factor", 1.5)
+        best_mse = float("inf")
+        best_snapshot = None
 
         for cycle in range(self.cfg["num_cycles"]):
             print(f"\n{'='*50}")
@@ -701,52 +703,50 @@ class GradientOptimizer:
             hist_a = self.run_cycle(cycle, frozen_mask=None)
             full_history.extend(hist_a)
 
-            # Record pre-relocation state
+            # Record Phase A MSE for best-snapshot tracking
             with torch.no_grad():
-                pre_reloc_render = self.renderer()
-            pre_reloc_mse = F.mse_loss(pre_reloc_render, self.target).item()
-            pre_snapshot = self._snapshot_params()
+                rendered = self.renderer()
+            cycle_mse = F.mse_loss(rendered, self.target).item()
+            if cycle_mse < best_mse:
+                best_mse = cycle_mse
+                best_snapshot = self._snapshot_params()
+                print(f"    New best MSE: {best_mse:.6f}")
 
-            # Phase B: Scan and relocate
+            # Phase B: Scan for useless shapes
             print(f"  Phase B: Scanning for useless shapes...")
-            error_map = compute_error_map(pre_reloc_render, self.target, self.alpha_mask)
-            relocate_mask = find_relocation_candidates(
+            error_map = compute_error_map(rendered, self.target, self.alpha_mask)
+            relocate_mask, n_use, n_less, n_unst = find_relocation_candidates(
                 self.renderer,
                 self.grad_history[-20:],
-                relocation_fraction=self.cfg["relocation_fraction"],
+                stability_threshold=self.cfg.get("reloc_stability_threshold", 1.0),
+                min_visibility=self.cfg.get("reloc_min_visibility", 2.0),
             )
             num_relocated = relocate_mask.sum().item()
-            print(f"    Relocating {num_relocated} shapes")
+            print(f"    useful={n_use} useless={n_less} unstable={n_unst}")
 
-            relocate_shapes(
+            if num_relocated == 0:
+                continue
+
+            # Phase B execute: z-order compact + relocate
+            print(f"    Relocating {num_relocated} shapes")
+            new_indices = relocate_shapes(
                 self.renderer, error_map, relocate_mask, num_types,
                 target=self.target,
-                smart_type_selection=self.cfg.get("smart_type_selection", False),
             )
 
+            # Reset Adam state after relocation (vinylizer: z-order changed)
+            self._reset_optimizer()
+
             # Phase C: Local optimization (frozen old shapes)
-            if num_relocated > 0:
-                print(f"  Phase C: Local optimization ({self.cfg['local_steps']} steps)")
-                hist_c = self.run_cycle(cycle, frozen_mask=~relocate_mask)
-                full_history.extend(hist_c)
+            print(f"  Phase C: Local optimization ({self.cfg['local_steps']} steps)")
+            frozen_mask = ~new_indices
+            hist_c = self.run_cycle(cycle, frozen_mask=frozen_mask)
+            full_history.extend(hist_c)
 
-                # Rollback check: if Phase C made things significantly worse, revert
-                with torch.no_grad():
-                    post_c_render = self.renderer()
-                post_c_mse = F.mse_loss(post_c_render, self.target).item()
-
-                if post_c_mse > pre_reloc_mse * rollback_threshold:
-                    print(
-                        f"    ⚠ MSE degraded ({pre_reloc_mse:.6f} → {post_c_mse:.6f}), "
-                        f"rolling back relocation"
-                    )
-                    self._restore_params(pre_snapshot)
-                    # Remove Phase C history entries
-                    full_history = full_history[:-len(hist_c)]
-                else:
-                    print(
-                        f"    MSE: {pre_reloc_mse:.6f} → {post_c_mse:.6f}"
-                    )
+        # Restore best snapshot at end (vinylizer: final best-cycle restore)
+        if best_snapshot is not None:
+            print(f"\nRestoring best cycle params (MSE={best_mse:.6f})")
+            self._restore_params(best_snapshot)
 
         return full_history
 

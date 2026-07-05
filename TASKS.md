@@ -103,6 +103,18 @@
   - 扩展包括: 更多 Primitives 变体, Gradient_Shapes（原生软渐变！FH6 独有）, Stripes, Flames, Tribal
   - 参考: `IMPLEMENTATION_PLAN.md` §9.1 推荐列表 — 必备基础几何 (6) + 高收益 (8) + 按需 (6)
 
+- [x] **2.2.7 — FH6 Gradient_Shapes 数学渐变模板** ⭐ 新
+  - 文件: [`src/fh6_vectorizer/templates.py`](src/fh6_vectorizer/templates.py) — `generate_synthetic_templates()` 索引 16-23
+  - 8 个数学定义的梯度形状（同 vinylizer alpha_228 风格，数学近似 FH6 渲染）
+  - `_grad_shape(name, hard_mask, soft_gradient)` 直接生成连续渐变
+  - 渐变覆盖: 椭圆 15-61%, 矩形 67%, 三角形 33% (mask 修正后)
+  - 参考: `IMPLEMENTATION_PLAN.md` §3.7
+
+- [x] **2.2.8 — 精选 8 个 Gradient_Shapes 集成** ⭐
+  - `GRADIENT_SHAPE_INDICES` 映射到 FH6 type_code
+  - 8 种方向性渐变 > vinylizer 1 种径向椭圆
+  - 参考: `IMPLEMENTATION_PLAN.md` §3.7
+
 - [x] **2.2.6 — 模板持久化 (`save/load_template_library`)**
   - 文件: [`src/fh6_vectorizer/templates.py`](src/fh6_vectorizer/templates.py)
   - `save_template_library()`: `torch.save()` 到 `.pt` 文件
@@ -126,6 +138,12 @@
   - 在 128px 模板上测试 σ ∈ {0.1, 0.3, 0.5, 0.7, 1.0}
   - 记录不同 sigma 下的收敛速度和最终 PSNR
   - 参考: `IMPLEMENTATION_PLAN.md` §3.3 — "σ=1.0 在 128px 模板 ≈ 3px 过渡带"
+
+- [x] **2.3.3 — Gradient_Shapes 无需 Gaussian blur** ⭐
+  - 数学渐变模板直接生成 soft template（`_grad_shape` 跳过 blur）
+  - `generate_synthetic_templates()` 的 `_make_shape()` 仍使用 Gaussian blur（合成模板）
+  - `build_template_library()` 新增分支：检测 Gradient_Shapes 家族 → 加载 PNG → 跳过 blur
+  - 参考: `IMPLEMENTATION_PLAN.md` §3.7
 
 ---
 

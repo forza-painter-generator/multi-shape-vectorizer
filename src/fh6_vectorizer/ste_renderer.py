@@ -171,22 +171,11 @@ def over_composite_render(
 
         tidx = type_indices[i].item()
 
-        hard_alpha = F.grid_sample(
-            hard[tidx:tidx + 1], grid,
-            mode="bilinear", padding_mode="zeros", align_corners=True,
-        ).squeeze(0).squeeze(0)  # [H, W]
-
-        soft_alpha = F.grid_sample(
+        # Continuous soft alpha directly (no STE, like vinylizer alpha_228)
+        alpha = F.grid_sample(
             soft[tidx:tidx + 1], grid,
             mode="bilinear", padding_mode="zeros", align_corners=True,
-        ).squeeze(0).squeeze(0)  # [H, W]
-
-        # Threshold hard alpha (binary) for exact FH6 rendering
-        hard_alpha = (hard_alpha > 0.5).float()
-
-        # STE trick
-        alpha = hard_alpha.detach() + soft_alpha - soft_alpha.detach()
-        alpha = alpha * opacity[i]  # [H, W]
+        ).squeeze(0).squeeze(0) * opacity[i]  # [H, W]
         alpha = torch.clamp(alpha, 0.0, 1.0)
 
         # Over composite in LINEAR space
@@ -514,17 +503,54 @@ class STEVectorRenderer(nn.Module):
         self.colors = nn.Parameter(torch.rand(num_shapes, 3, device=device))
         self.opacity = nn.Parameter(torch.ones(num_shapes, device=device))
 
-    def forward(self, use_tiling: bool = None) -> torch.Tensor:
+    def forward(self, return_alpha: bool = False) -> torch.Tensor:
         """
         Render current shapes to canvas.
-        GPU: Triton tile-based kernel (verified forward+backward).
-        CPU: PyTorch fallback.
+        GPU: Triton tile-based kernel. CPU: PyTorch fallback.
 
-        Returns: [3, H, W] rendered image in sRGB [0, 1].
+        Returns: [3, H, W] or [4, H, W] rendered image in sRGB [0, 1].
+        If return_alpha=True, 4th channel is total opacity (1 - transmittance).
         """
         if self.device == "cuda":
-            return self._triton_forward()
-        return self._pytorch_forward(use_tiling=use_tiling)
+            result = self._triton_forward()
+        else:
+            result = self._pytorch_forward()
+        if return_alpha:
+            alpha = self._render_alpha_map()
+            result = torch.cat([result, alpha.unsqueeze(0)], dim=0)
+        return result
+
+    def _render_alpha_map(self) -> torch.Tensor:
+        """Render alpha channel: render all shapes in white on black background."""
+        with torch.no_grad():
+            if self.device == "cuda":
+                from .triton_kernels_v2 import TritonV2Soft
+                from .loss import srgb_to_linear
+                white_colors = torch.ones_like(self.colors)
+                black_bg = torch.zeros(3, device=self.device)
+                bg_lin = srgb_to_linear(black_bg)
+                alpha_lin = TritonV2Soft.apply(
+                    self.hard_templates, self.soft_templates, self.type_indices,
+                    self.cx, self.cy, self.rx, self.ry, self.angle,
+                    white_colors, self.opacity,
+                    self.canvas_height, self.canvas_width, bg_lin,
+                )
+                # alpha = luminance of rendering white shapes on black
+                from .loss import linear_to_srgb
+                alpha = linear_to_srgb(alpha_lin.permute(2, 0, 1))
+                return alpha.mean(dim=0).clamp(0.0, 1.0)
+            else:
+                return over_composite_render(
+                    hard_templates=self.hard_templates,
+                    soft_templates=self.soft_templates,
+                    type_indices=self.type_indices,
+                    cx=self.cx, cy=self.cy, rx=self.rx, ry=self.ry, angle=self.angle,
+                    colors=torch.ones_like(self.colors),
+                    opacity=self.opacity,
+                    canvas_height=self.canvas_height, canvas_width=self.canvas_width,
+                    background=torch.zeros(3, device=self.device),
+                    device=self.device,
+                ).mean(dim=0)
 
     def _triton_forward(self) -> torch.Tensor:
         """Triton tile-based forward + backward (via autograd Function)."""
