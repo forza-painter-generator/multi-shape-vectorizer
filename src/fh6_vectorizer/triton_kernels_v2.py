@@ -49,7 +49,7 @@ def _fwd(TMPL,TIDX,CX,CY,RX,RY,ANG,COL,OP,TOFF,TSHAPES,OUT,
             v00=tl.load(bp+y0*T+x0,mask=mk,other=0.0);v10=tl.load(bp+y0*T+x1,mask=mk,other=0.0)
             v01=tl.load(bp+y1*T+x0,mask=mk,other=0.0);v11=tl.load(bp+y1*T+x1,mask=mk,other=0.0)
             ar=(1-fx)*(1-fy)*v00+fx*(1-fy)*v10+(1-fx)*fy*v01+fx*fy*v11
-            a=tl.where(ar>0.5,1.0,0.0)*sop;a=tl.clamp(a,0.0,1.0)
+            a=tl.clamp(ar*sop,0.0,1.0)
             cr=tl.load(COL+si*3+0);cg=tl.load(COL+si*3+1);cb=tl.load(COL+si*3+2)
             w=a*Tt;Cr+=w*cr;Cg+=w*cg;Cb+=w*cb;Tt*=(1.0-a)
         i3=(py*W+px)*3
@@ -164,7 +164,7 @@ class TritonV2STE(Function):
         ctx.save_for_backward(s,ti,cx.detach(),cy.detach(),rx.detach(),ry.detach(),
                               ang.detach(),col.detach(),op.detach())
         ctx.H,ctx.W=H,W
-        with torch.no_grad():return triton_fwd(h,ti,cx,cy,rx,ry,ang,col,op,H,W,bg_lin)
+        with torch.no_grad():return triton_fwd(s,ti,cx,cy,rx,ry,ang,col,op,H,W,bg_lin)
     @staticmethod
     def backward(ctx,go):
         s,ti,cx,cy,rx,ry,ang,col,op=ctx.saved_tensors;H,W=ctx.H,ctx.W

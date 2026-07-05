@@ -454,6 +454,17 @@ class GradientOptimizer:
 
         return total, loss_dict
 
+    def _eval_target(self) -> torch.Tensor:
+        """Return the evaluation target, matching step-loss MSE formula.
+
+        Transparent pixels use black background (same as _optimize_step).
+        This ensures snapshot MSE matches the logged step MSE.
+        """
+        if self.alpha_mask is not None:
+            bg = torch.zeros(3, 1, 1, device=self.device)
+            return self.target * self.alpha_mask + bg * (1.0 - self.alpha_mask)
+        return self.target
+
     def _optimize_step(self, frozen_mask: Optional[torch.Tensor] = None) -> dict:
         """
         Single optimization step.
@@ -704,9 +715,11 @@ class GradientOptimizer:
             full_history.extend(hist_a)
 
             # Record Phase A MSE for best-snapshot tracking
+            # Use same MSE formula as step loss (transparent→black bg)
             with torch.no_grad():
                 rendered = self.renderer()
-            cycle_mse = F.mse_loss(rendered, self.target).item()
+                target_ref = self._eval_target()
+            cycle_mse = F.mse_loss(rendered, target_ref).item()
             if cycle_mse < best_mse:
                 best_mse = cycle_mse
                 best_snapshot = self._snapshot_params()
@@ -742,6 +755,16 @@ class GradientOptimizer:
             frozen_mask = ~new_indices
             hist_c = self.run_cycle(cycle, frozen_mask=frozen_mask)
             full_history.extend(hist_c)
+
+            # Also check after Phase C — local opt often beats Phase A
+            with torch.no_grad():
+                rendered = self.renderer()
+                target_ref = self._eval_target()
+            cycle_mse = F.mse_loss(rendered, target_ref).item()
+            if cycle_mse < best_mse:
+                best_mse = cycle_mse
+                best_snapshot = self._snapshot_params()
+                print(f"    New best MSE (after Phase C): {best_mse:.6f}")
 
         # Restore best snapshot at end (vinylizer: final best-cycle restore)
         if best_snapshot is not None:

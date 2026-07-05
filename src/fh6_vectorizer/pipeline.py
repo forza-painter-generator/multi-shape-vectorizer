@@ -224,8 +224,13 @@ def run_pipeline(
             json.dump(history, f, indent=2)
         print(f"Saved loss history to {history_path}")
 
-    # Compute final metrics
-    mse = torch.nn.functional.mse_loss(final, target).item()
+    # Compute final metrics (match optimizer's MSE formula)
+    if has_transparency:
+        bg = torch.zeros(3, 1, 1, device=device)
+        target_eval = target * alpha_mask + bg * (1.0 - alpha_mask)
+    else:
+        target_eval = target
+    mse = torch.nn.functional.mse_loss(final, target_eval).item()
     psnr = 10 * math.log10(1.0 / mse) if mse > 0 else float("inf")
     print(f"\nFinal metrics: MSE={mse:.6f}, PSNR={psnr:.2f} dB")
 
