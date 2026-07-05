@@ -48,14 +48,11 @@ VINYL_TYPE_BASES = {
 # from the game engine rendering, but the visual impact is negligible.
 # See IMPLEMENTATION_PLAN.md §3.7 for rationale.
 GRADIENT_SHAPE_INDICES = {
-    16: 1048777 + 28 - 1,  # gradient_ellipse1 → FH6 Gradient_Shapes #28
-    17: 1048777 + 26 - 1,  # gradient_ellipse2 → FH6 Gradient_Shapes #26
-    18: 1048777 + 11 - 1,  # gradient_rect1    → FH6 Gradient_Shapes #11
-    19: 1048777 + 12 - 1,  # gradient_rect2    → FH6 Gradient_Shapes #12
-    20: 1048777 + 13 - 1,  # gradient_rect3    → FH6 Gradient_Shapes #13
-    21: 1048777 + 16 - 1,  # gradient_rect4    → FH6 Gradient_Shapes #16
-    22: 1048777 + 17 - 1,  # gradient_rect5    → FH6 Gradient_Shapes #17
-    23: 1048777 + 21 - 1,  # gradient_triangle1→ FH6 Gradient_Shapes #21
+    0: 1048777 + 28 - 1,  # gradient_ellipse1 → FH6 Gradient_Shapes #28
+    1: 1048777 + 11 - 1,  # gradient_rect1    → FH6 Gradient_Shapes #11
+    2: 1048777 + 12 - 1,  # gradient_rect2    → FH6 Gradient_Shapes #12
+    3: 1048777 + 13 - 1,  # gradient_rect3    → FH6 Gradient_Shapes #13
+    4: 1048777 + 16 - 1,  # gradient_rect4    → FH6 Gradient_Shapes #16
 }
 
 # Recommended subset of shapes for the PoC (from the implementation plan)
@@ -258,155 +255,11 @@ def generate_synthetic_templates(
     # === 5 Mathematical Gradient Shapes ===
     y_idx, x_idx = np.mgrid[:s, :s]
 
-    # 0: Filled circle
-    canvas = np.zeros((s, s), dtype=np.float32)
-    cv2.circle(canvas, (center, center), int(s * 0.45), 1.0, -1)
-    _make_shape("circle", canvas)
-
-    # 1: Filled square
-    canvas = np.zeros((s, s), dtype=np.float32)
-    margin = int(s * 0.1)
-    cv2.rectangle(canvas, (margin, margin), (s - margin, s - margin), 1.0, -1)
-    _make_shape("square", canvas)
-
-    # 2: Filled triangle
-    canvas = np.zeros((s, s), dtype=np.float32)
-    pts = np.array([[center, s * 0.1], [s * 0.1, s * 0.9], [s * 0.9, s * 0.9]], dtype=np.int32)
-    cv2.fillPoly(canvas, [pts], 1.0)
-    _make_shape("triangle", canvas)
-
-    # 3: Filled ellipse
-    canvas = np.zeros((s, s), dtype=np.float32)
-    cv2.ellipse(canvas, (center, center), (int(s * 0.4), int(s * 0.25)), 0, 0, 360, 1.0, -1)
-    _make_shape("ellipse", canvas)
-
-    # 4: Filled diamond
-    canvas = np.zeros((s, s), dtype=np.float32)
-    pts = np.array([[center, s * 0.05], [s * 0.95, center], [center, s * 0.95], [s * 0.05, center]], dtype=np.int32)
-    cv2.fillPoly(canvas, [pts], 1.0)
-    _make_shape("diamond", canvas)
-
-    # 5: Star (5-point)
-    canvas = np.zeros((s, s), dtype=np.float32)
-    outer_r = int(s * 0.45)
-    inner_r = int(s * 0.2)
-    star_pts = []
-    for i in range(10):
-        r = outer_r if i % 2 == 0 else inner_r
-        angle = math.pi / 2 + i * math.pi / 5
-        star_pts.append([int(center + r * math.cos(angle)), int(center - r * math.sin(angle))])
-    cv2.fillPoly(canvas, [np.array(star_pts, dtype=np.int32)], 1.0)
-    _make_shape("star", canvas)
-
-    # 6: Cross
-    canvas = np.zeros((s, s), dtype=np.float32)
-    arm_w = int(s * 0.2)
-    cv2.rectangle(canvas, (center - arm_w, 0), (center + arm_w, s), 1.0, -1)
-    cv2.rectangle(canvas, (0, center - arm_w), (s, center + arm_w), 1.0, -1)
-    _make_shape("cross", canvas)
-
-    # 7: Ring (hollow circle)
-    canvas = np.zeros((s, s), dtype=np.float32)
-    cv2.circle(canvas, (center, center), int(s * 0.45), 1.0, -1)
-    cv2.circle(canvas, (center, center), int(s * 0.25), 0.0, -1)
-    _make_shape("ring", canvas)
-
-    # 8: Pentagon (regular 5-sided)
-    canvas = np.zeros((s, s), dtype=np.float32)
-    r = int(s * 0.45)
-    pent_pts = []
-    for i in range(5):
-        ang = -math.pi / 2 + i * 2 * math.pi / 5
-        pent_pts.append([int(center + r * math.cos(ang)), int(center + r * math.sin(ang))])
-    cv2.fillPoly(canvas, [np.array(pent_pts, dtype=np.int32)], 1.0)
-    _make_shape("pentagon", canvas)
-
-    # 9: Hexagon (regular 6-sided)
-    canvas = np.zeros((s, s), dtype=np.float32)
-    r = int(s * 0.45)
-    hex_pts = []
-    for i in range(6):
-        ang = i * 2 * math.pi / 6
-        hex_pts.append([int(center + r * math.cos(ang)), int(center + r * math.sin(ang))])
-    cv2.fillPoly(canvas, [np.array(hex_pts, dtype=np.int32)], 1.0)
-    _make_shape("hexagon", canvas)
-
-    # 10: Crescent (moon shape — difference of two offset circles)
-    canvas = np.zeros((s, s), dtype=np.float32)
-    cx1, cy1 = int(s * 0.42), center
-    cx2, cy2 = int(s * 0.58), int(s * 0.55)
-    r_moon = int(s * 0.42)
-    cv2.circle(canvas, (cx1, cy1), r_moon, 1.0, -1)
-    cv2.circle(canvas, (cx2, cy2), r_moon, 0.0, -1)
-    _make_shape("crescent", canvas)
-
-    # 11: Heart
-    canvas = np.zeros((s, s), dtype=np.float32)
-    # Two circles top + triangle bottom
-    r_h = int(s * 0.22)
-    cv2.circle(canvas, (int(s * 0.33), int(s * 0.32)), r_h, 1.0, -1)
-    cv2.circle(canvas, (int(s * 0.67), int(s * 0.32)), r_h, 1.0, -1)
-    heart_pts = np.array([
-        [s * 0.10, s * 0.40], [s * 0.90, s * 0.40],
-        [center, s * 0.92],
-    ], dtype=np.int32)
-    cv2.fillPoly(canvas, [heart_pts], 1.0)
-    _make_shape("heart", canvas)
-
-    # 12: Arrow (right-pointing)
-    canvas = np.zeros((s, s), dtype=np.float32)
-    arrow_pts = np.array([
-        [s * 0.05, s * 0.35], [s * 0.55, s * 0.35],
-        [s * 0.55, s * 0.10], [s * 0.95, center],
-        [s * 0.55, s * 0.90], [s * 0.55, s * 0.65],
-        [s * 0.05, s * 0.65],
-    ], dtype=np.int32)
-    cv2.fillPoly(canvas, [arrow_pts], 1.0)
-    _make_shape("arrow", canvas)
-
-    # 13: Droplet / teardrop
-    canvas = np.zeros((s, s), dtype=np.float32)
-    drop_pts = np.array([
-        [center, s * 0.05],
-        [int(s * 0.85), int(s * 0.55)],
-        [int(s * 0.68), s - 10],
-        [center, int(s * 0.88)],
-        [int(s * 0.32), s - 10],
-        [int(s * 0.15), int(s * 0.55)],
-    ], dtype=np.int32)
-    cv2.fillPoly(canvas, [drop_pts], 1.0)
-    _make_shape("droplet", canvas)
-
-    # 14: Chevron (>> shape)
-    canvas = np.zeros((s, s), dtype=np.float32)
-    chev_pts = np.array([
-        [s * 0.05, s * 0.20], [s * 0.50, center],
-        [s * 0.05, s * 0.80], [s * 0.30, s * 0.80],
-        [s * 0.65, center], [s * 0.30, s * 0.20],
-    ], dtype=np.int32)
-    cv2.fillPoly(canvas, [chev_pts], 1.0)
-    _make_shape("chevron", canvas)
-
-    # 15: Star (4-point / sparkle)
-    canvas = np.zeros((s, s), dtype=np.float32)
-    star4_pts = np.array([
-        [center, s * 0.05], [int(s * 0.58), int(s * 0.38)],
-        [s * 0.95, center], [int(s * 0.58), int(s * 0.62)],
-        [center, s * 0.95], [int(s * 0.42), int(s * 0.62)],
-        [s * 0.05, center], [int(s * 0.42), int(s * 0.38)],
-    ], dtype=np.int32)
-    cv2.fillPoly(canvas, [star4_pts], 1.0)
-    _make_shape("star4", canvas)
-
-    # === 8 Mathematical Gradient Shapes (approximating FH6 Gradient_Shapes) ===
-    # Like vinylizer's alpha_228, these are mathematical approximations of
-    # FH6's game-engine gradient rendering. Slight mismatch vs. in-game is negligible.
-    # All use continuous gradient → no Gaussian blur needed for soft templates.
-
+    # === 5 Mathematical Gradient Shapes ===
     y_idx, x_idx = np.mgrid[:s, :s]
-    tx = x_idx.astype(np.float32) / (s - 1)  # [s, s] horizontal
-    ty = y_idx.astype(np.float32) / (s - 1)  # [s, s] vertical
-    cx_n = center / (s - 1)                   # template center normalized
+    tx = x_idx.astype(np.float32) / (s - 1)
+    ty = y_idx.astype(np.float32) / (s - 1)
+    cx_n = center / (s - 1)
     cy_n = center / (s - 1)
 
     def _grad_shape(name, hard_mask, soft_grad):
@@ -414,44 +267,36 @@ def generate_synthetic_templates(
         hard.append(torch.from_numpy(hard_mask.astype(np.float32)))
         soft.append(torch.from_numpy(soft_grad.astype(np.float32)))
 
-    # 16: Gradient Ellipse 1 (center→edge radial, like alpha_228 / FH6 #28)
+    # 0: Gradient Ellipse 1 (center→edge radial, like alpha_228 / FH6 #28)
     d = np.sqrt(((tx - cx_n) / 0.45) ** 2 + ((ty - cy_n) / 0.45) ** 2)
     ellipse_mask = (d <= 1.0).astype(np.float32)
     grad = np.clip(1.0 - d, 0.0, 1.0)
     _grad_shape("gradient_ellipse1", ellipse_mask, grad)
 
-    # 17: Gradient Ellipse 2 (center 50% solid→edge, FH6 #26)
-    grad = np.clip((0.5 - d) / 0.5, 0.0, 1.0)
-    _grad_shape("gradient_ellipse2", ellipse_mask, grad)
-
-    # 18: Gradient Rect 1 (center→right edge, FH6 #11)
+    # 1: Gradient Rect 1 (center→right edge, FH6 #11)
     rect_mask = np.zeros((s, s), dtype=np.float32)
     m = int(s * 0.1); cv2.rectangle(rect_mask, (m, m), (s - m, s - m), 1.0, -1)
     grad = np.clip(1.0 - 2.0 * np.maximum(tx - 0.5, 0.0), 0.0, 1.0) * rect_mask
     _grad_shape("gradient_rect1", rect_mask, grad)
 
-    # 19: Gradient Rect 2 (top-left solid→bottom-right, FH6 #12)
+    # 2: Gradient Rect 2 (top-left→bottom-right, FH6 #12)
     grad = np.clip(1.0 - (tx + ty) * 0.5, 0.0, 1.0) * rect_mask
     _grad_shape("gradient_rect2", rect_mask, grad)
 
-    # 20: Gradient Rect 3 (left edge solid→right edge, FH6 #13)
+    # 3: Gradient Rect 3 (left edge→right edge, FH6 #13)
     grad = np.clip(1.0 - tx, 0.0, 1.0) * rect_mask
     _grad_shape("gradient_rect3", rect_mask, grad)
 
-    # 21: Gradient Rect 4 (three corners→bottom-right, FH6 #16)
+    # 4: Gradient Rect 4 (three corners→bottom-right, FH6 #16)
     grad = np.clip((tx + ty) * 0.5, 0.0, 1.0) * rect_mask
     _grad_shape("gradient_rect4", rect_mask, grad)
 
-    # 22: Gradient Rect 5 (center vert line→left & right, FH6 #17)
-    grad = np.clip(1.0 - 2.0 * np.abs(tx - 0.5), 0.0, 1.0) * rect_mask
-    _grad_shape("gradient_rect5", rect_mask, grad)
-
-    # 23: Gradient Triangle 1 (right tip→left base, FH6 #21)
-    tri_mask = np.zeros((s, s), dtype=np.float32)
-    tri_pts = np.array([[s * 0.1, s * 0.5], [s * 0.9, s * 0.1], [s * 0.9, s * 0.9]], dtype=np.int32)
-    cv2.fillPoly(tri_mask, [tri_pts], 1.0)
-    grad = (tx - 0.1) / 0.8 * tri_mask
-    _grad_shape("gradient_triangle1", tri_mask, np.clip(grad, 0.0, 1.0))
+    # --- Removed shapes ---
+    # 16 geometric shapes (circle, square, etc.): Gaussian blur edge-only gradient
+    #   → limited gradient (~40% coverage) vs mathematical gradients (61-67%)
+    # gradient_ellipse2 (#17): center 50% solid → only 15% non-zero gradient area
+    # gradient_rect5 (#22): center line → left & right, redundant with rect1+rect3
+    # gradient_triangle1 (#23): tip→base, only 33% gradient in triangle area
 
     # Truncate to requested number
     hard = hard[:num_types]

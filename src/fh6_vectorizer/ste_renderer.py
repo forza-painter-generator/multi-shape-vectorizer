@@ -524,12 +524,12 @@ class STEVectorRenderer(nn.Module):
         """Render alpha channel: render all shapes in white on black background."""
         with torch.no_grad():
             if self.device == "cuda":
-                from .triton_kernels_v2 import TritonV2Soft
+                from .triton_kernels_v2 import TritonV2STE
                 from .loss import srgb_to_linear
                 white_colors = torch.ones_like(self.colors)
                 black_bg = torch.zeros(3, device=self.device)
                 bg_lin = srgb_to_linear(black_bg)
-                alpha_lin = TritonV2Soft.apply(
+                alpha_lin = TritonV2STE.apply(
                     self.hard_templates, self.soft_templates, self.type_indices,
                     self.cx, self.cy, self.rx, self.ry, self.angle,
                     white_colors, self.opacity,
