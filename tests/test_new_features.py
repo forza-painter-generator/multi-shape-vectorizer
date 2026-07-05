@@ -21,14 +21,13 @@ from fh6_vectorizer.optimizer import _flatten_config
 
 
 def test_all():
-    # 1: 16 templates
-    print("Test 1: 16 synthetic templates...")
-    lib = generate_synthetic_templates(num_types=16)
-    assert lib["hard"].shape[0] == 16
-    assert lib["soft"].shape[0] == 16
-    assert "pentagon" in lib["names"]
-    assert "heart" in lib["names"]
-    assert "crescent" in lib["names"]
+    # 1: 5 gradient templates
+    print("Test 1: 5 gradient templates...")
+    lib = generate_synthetic_templates(num_types=5)
+    assert lib["hard"].shape[0] == 5
+    assert lib["soft"].shape[0] == 5
+    assert "gradient_ellipse1" in lib["names"]
+    assert "gradient_rect1" in lib["names"]
     print(f"  PASS — {lib['names']}")
 
     # 2: sRGB roundtrip

@@ -68,14 +68,10 @@ def main():
                         help="Grayscale MSE loss weight (default: 0)")
     parser.add_argument("--alpha-reg", type=float, default=0.0,
                         help="Alpha regularization weight (default: 0)")
-    parser.add_argument("--smart-types", action="store_true",
-                        help="Enable smart type selection during relocation")
     parser.add_argument("--no-importance", action="store_true",
                         help="Disable importance-map-based initialization")
 
     # Templates
-    parser.add_argument("--fh6-data", type=str, default=None,
-                        help="Path to FH6 Vinyls/ directory for real shape data")
     parser.add_argument("--template-cache", type=str, default=None,
                         help="Path to cache/load pre-built template library")
     parser.add_argument("--config-file", type=str, default=None,
@@ -122,8 +118,6 @@ def main():
         config["grayscale_weight"] = args.grayscale_weight
     if args.alpha_reg > 0:
         config["alpha_reg_weight"] = args.alpha_reg
-    if args.smart_types:
-        config["smart_type_selection"] = True
     if args.no_importance:
         config["use_importance_sampling"] = False
     if args.fh6_json:
@@ -139,8 +133,6 @@ def main():
         num_shapes=args.num_shapes,
         num_types=args.num_types,
         canvas_size=(args.size[0], args.size[1]),
-        use_fh6_data=args.fh6_data is not None,
-        fh6_vinyls_root=Path(args.fh6_data) if args.fh6_data else None,
         template_cache_path=Path(args.template_cache) if args.template_cache else None,
         snapshot_dir=Path(args.snapshot_dir) if args.snapshot_dir else None,
         config=config,

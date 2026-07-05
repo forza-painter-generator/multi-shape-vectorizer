@@ -30,11 +30,11 @@ class TestTemplates:
 
     def test_synthetic_generation(self):
         """Synthetic templates should have correct shape and value ranges."""
-        lib = generate_synthetic_templates(num_types=8, device="cpu")
+        lib = generate_synthetic_templates(num_types=5, device="cpu")
 
-        assert lib["hard"].shape == (8, TEMPLATE_SIZE, TEMPLATE_SIZE)
-        assert lib["soft"].shape == (8, TEMPLATE_SIZE, TEMPLATE_SIZE)
-        assert len(lib["names"]) == 8
+        assert lib["hard"].shape == (5, TEMPLATE_SIZE, TEMPLATE_SIZE)
+        assert lib["soft"].shape == (5, TEMPLATE_SIZE, TEMPLATE_SIZE)
+        assert len(lib["names"]) == 5
 
         # Hard templates are binary
         hard_vals = lib["hard"].unique()

@@ -34,7 +34,7 @@ from .loss import (
     alpha_regularization,
     VGGFeatureExtractor,
 )
-from .ste_renderer import STEVectorRenderer, over_composite_render
+from .ste_renderer import STEVectorRenderer
 from .preprocess import (
     compute_importance_map,
     importance_weighted_sample,
@@ -204,70 +204,6 @@ def relocate_shapes(
     return new_indices
 
 
-def _select_best_types(
-    renderer: STEVectorRenderer,
-    relocate_mask: torch.Tensor,
-    target: torch.Tensor,
-    num_types: int,
-    positions_cx: torch.Tensor,
-    positions_cy: torch.Tensor,
-    device: str,
-    patch_size: int = 32,
-):
-    """
-    For each relocated shape, try all template types and pick the best one
-    based on local MSE against the target image.
-
-    This is an expensive but effective way to choose template types.
-
-    Args:
-        renderer: STEVectorRenderer
-        relocate_mask: [N] bool mask
-        target: [3, H, W] target image
-        num_types: number of template types
-        positions_cx, positions_cy: [num_reloc] new positions
-        device: torch device
-        patch_size: size of local patch to compare
-    """
-    relocate_indices = torch.where(relocate_mask)[0]
-    num_reloc = len(relocate_indices)
-    H, W = target.shape[1], target.shape[2]
-    half = patch_size // 2
-
-    for j, global_idx in enumerate(relocate_indices):
-        cx = int(positions_cx[j].item())
-        cy = int(positions_cy[j].item())
-
-        # Extract local target patch
-        y0 = max(0, cy - half)
-        y1 = min(H, cy + half)
-        x0 = max(0, cx - half)
-        x1 = min(W, cx + half)
-        target_patch = target[:, y0:y1, x0:x1]  # [3, ph, pw]
-
-        best_type = 0
-        best_mse = float("inf")
-
-        # Temporarily set position
-        orig_cx = renderer.cx.data[global_idx].clone()
-        orig_cy = renderer.cy.data[global_idx].clone()
-        renderer.cx.data[global_idx] = float(cx)
-        renderer.cy.data[global_idx] = float(cy)
-
-        for t in range(num_types):
-            renderer.type_indices.data[global_idx] = t
-            with torch.no_grad():
-                rendered = renderer()
-                rendered_patch = rendered[:, y0:y1, x0:x1]
-                mse = F.mse_loss(rendered_patch, target_patch).item()
-                if mse < best_mse:
-                    best_mse = mse
-                    best_type = t
-
-        # Restore position (unchanged) and set best type
-        renderer.cx.data[global_idx] = orig_cx
-        renderer.cy.data[global_idx] = orig_cy
-        renderer.type_indices.data[global_idx] = best_type
 
 
 class GradientOptimizer:
@@ -347,7 +283,6 @@ class GradientOptimizer:
             # Init
             "use_importance_sampling": True,
             "smart_color_init": True,
-            "smart_type_selection": False,
         }
         if config:
             # Flatten nested config

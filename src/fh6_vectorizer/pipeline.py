@@ -14,7 +14,6 @@ import torch
 from PIL import Image
 
 from .templates import (
-    build_template_library,
     generate_synthetic_templates,
     load_template_library,
     save_template_library,
@@ -92,8 +91,6 @@ def run_pipeline(
     num_shapes: int = 200,
     num_types: int = 8,
     canvas_size: tuple[int, int] = (256, 256),
-    use_fh6_data: bool = False,
-    fh6_vinyls_root: Optional[Path] = None,
     template_cache_path: Optional[Path] = None,
     snapshot_dir: Optional[Path] = None,
     config: Optional[dict] = None,
@@ -108,8 +105,6 @@ def run_pipeline(
         num_shapes: N, number of shapes to optimize
         num_types: number of template types (for synthetic templates)
         canvas_size: (H, W) rendering resolution
-        use_fh6_data: whether to use real FH6 shape data
-        fh6_vinyls_root: path to FH6 Vinyls/ directory
         template_cache_path: path to cache/load pre-built templates
         snapshot_dir: if set, save intermediate renders here every N steps
         config: optimizer hyperparameters
@@ -127,12 +122,6 @@ def run_pipeline(
     if template_cache_path and Path(template_cache_path).exists():
         print(f"  Loading cached templates from {template_cache_path}")
         library = load_template_library(Path(template_cache_path), device=device)
-    elif use_fh6_data and fh6_vinyls_root:
-        print(f"  Building FH6 templates from {fh6_vinyls_root}")
-        library = build_template_library(
-            vinyls_root=Path(fh6_vinyls_root),
-            device=device,
-        )
     else:
         print(f"  Generating {num_types} synthetic templates")
         library = generate_synthetic_templates(
